@@ -1,13 +1,11 @@
 {
-  "tabWidth": 2,
-  "useTabs": false,
+  "printWidth": 96,
+  "trailingComma": "all",
   "overrides": [
     {
+      "comment": "wrangler.jsonc is read by wrangler, not by us. No trailing commas.",
       "files": ["*.jsonc"],
-      "options": {
-        "trailingComma": "none"
-      }
+      "options": { "trailingComma": "none" }
     }
-  ],
-  "plugins": ["@trivago/prettier-plugin-sort-imports"]
+  ]
 }

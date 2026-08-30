@@ -1,228 +1,428 @@
-# LLM Proxy on Cloudflare Workers
+# rewindly-api-hop
 
-English | [日本語](README_ja.md)
+The AI gateway for Rewindly. **One URL, one API key, one endpoint** — for every AI task
+the backend performs, whatever kind of task it is.
 
-[![Deploy to Cloudflare Workers](https://deploy.workers.cloudflare.com/button)](https://deploy.workers.cloudflare.com/?url=https://github.com/blue-pen5805/llm-proxy-on-cloudflare-workers)
+The backend does not choose a Gemini model, does not hold a Gemini key, and does not know
+how many keys exist. It names an **intent**; this Worker decides which model and which of
+our four free-tier keys serves it, against live per-key quota counters, and hops to
+another when one runs out.
 
-This is a serverless proxy built on [Cloudflare Workers](https://www.cloudflare.com/developer-platform/products/workers/) that integrates with multiple Large Language Model (LLM) APIs. Inspired by [LiteLLM](https://github.com/BerriAI/litellm).
+Deployed at **`https://api-hop.rewindly.workers.dev`**.
 
-## Features
-
-- **Centralized API Key Management:** Manage all your LLM API keys in one place.
-- **Pass-through Endpoints:** Forward requests directly to any LLM API with minimal changes.
-  - Examples: `/openai/chat/completions`, `/google-ai-studio/v1beta/models/gemini-2.5-pro:generateContent`
-- **OpenAI-Compatible Endpoints:** Use standard OpenAI endpoints for seamless integration with existing tools and libraries.
-  - `/v1/chat/completions`
-  - `/v1/models`
-- **Cloudflare AI Gateway Integration:** Leverage [Cloudflare AI Gateway](https://www.cloudflare.com/developer-platform/products/ai-gateway/), including its [Universal Endpoint](https://developers.cloudflare.com/ai-gateway/providers/universal/), for logging, analytics, and other features.
-- **Global Round-Robin Key Rotation:** Consistency across all isolates using Cloudflare Durable Objects.
-- **API Key Selection via Path Parameter:** Explicitly select or rotate within a range of API keys using `/key/{index|range}/` in the URL path.
-
-```mermaid
-flowchart
-  A[USER] -->　B(LLM Proxy)
-  B --> C(Cloudflare AI Gateway)
-  B --> D
-  C --> D["LLM API (OpenAI, Google AI Studio, Anthropic ...)"]
+```bash
+curl -X POST https://api-hop.rewindly.workers.dev/v1/invoke \
+  -H "Authorization: Bearer $HOP_GATEWAY_API_KEY" \
+  -H 'content-type: application/json' \
+  -d '{"intent":"classify","payload":{"messages":[{"role":"user","content":"..."}]}}'
 ```
 
-## Supported Providers
+---
 
-| Name             | Chat Completions | Direct | AI Gateway Support | Pass-Through Routes | Environment Variable                         |
-| ---------------- | ---------------- | ------ | ------------------ | ------------------- | -------------------------------------------- |
-| OpenAI           | ✅               | ✅     | ✅                 | `openai`            | `OPENAI_API_KEY`                             |
-| Google AI Studio | ✅               | ✅     | ✅                 | `google-ai-studio`  | `GEMINI_API_KEY`                             |
-| Anthropic        | ✅               | ✅     | ✅                 | `anthropic`         | `ANTHROPIC_API_KEY`                          |
-| Cerebras         | ✅               | ❌     | ✅                 | `cerebras`          | `CEREBRAS_API_KEY`                           |
-| Cohere           | ✅               | ✅     | ✅                 | `cohere`            | `COHERE_API_KEY`                             |
-| DeepSeek         | ✅               | ✅     | ✅                 | `deepseek`          | `DEEPSEEK_API_KEY`                           |
-| Grok             | ✅               | ✅     | ✅                 | `grok`              | `GROK_API_KEY`                               |
-| Groq             | ✅               | ✅     | ✅                 | `groq`              | `GROQ_API_KEY`                               |
-| Mistral          | ✅               | ✅     | ✅                 | `mistral`           | `MISTRAL_API_KEY`                            |
-| Perplexity       | ✅               | ✅     | ✅                 | `perplexity`        | `PERPLEXITY_API_KEY`                         |
-| Azure OpenAI     | ❌               | ❌     | ❌                 | `azure-openai`      |                                              |
-| Vertex AI        | ❌               | ❌     | ❌                 | `google-vertex-ai`  |                                              |
-| Amazon Bedrock   | ❌               | ❌     | ❌                 | `aws-bedrock`       |                                              |
-| OpenRouter       | ✅               | ✅     | ✅                 | `openrouter`        | `OPENROUTER_API_KEY`                         |
-| Workers AI       | ✅               | ✅     | ✅                 | `workers-ai`        | `CLOUDFLARE_ACCOUNT_ID` `CLOUDFLARE_API_KEY` |
-| HuggingFace      | ❌               | ✅     | ✅                 | `huggingface`       | `HUGGINGFACE_API_KEY`                        |
-| Replicate        | ❌               | ✅     | ✅                 | `replicate`         | `REPLICATE_API_KEY`                          |
-| Ollama           | ✅               | ✅     | ❌                 | `ollama`            | `OLLAMA_API_KEY`                             |
+## Public surface
 
-**Note**: Providers marked with ⚠️ have limited support for certain features (e.g., Tool Use, multimodal capabilities).
+| Route              | Auth                                          | What it does                                    |
+| ------------------ | --------------------------------------------- | ----------------------------------------------- |
+| `POST /v1/invoke`  | `Authorization: Bearer <HOP_GATEWAY_API_KEY>` | The only task endpoint.                         |
+| `GET /health`      | none                                          | Liveness, plus the list of implemented intents. |
+| `GET /debug/usage` | same bearer                                   | Current per-key, per-model counters and limits. |
 
-## Prerequisites
+There is nothing else. Every provider-prefixed passthrough, `/v1/chat/completions`,
+`/v1/models`, and the `/key/{index}/` selector are gone — see [What was
+stripped](#what-was-stripped).
 
-Before you begin, ensure you have the following installed:
+### Request
 
-- **Node.js:** Version `22.12+` or later is required.
-  - Download from: [nodejs.org](https://nodejs.org/)
-  - Verify your version: Run `node -v` in your terminal.
-- **Cloudflare Account:** A Free Plan is probably sufficient to deploy this project.
-  - Sign up for free at: [cloudflare.com](https://www.cloudflare.com/)
+```json
+{
+  "intent": "classify",
+  "payload": { "messages": [{ "role": "user", "content": "..." }] },
+  "options": { "temperature": 0, "max_output_tokens": 2048 }
+}
+```
 
-## Quick Start
+### Response
 
-1. Clone this repository.
-2. Install dependencies: `npm install`
-3. Authenticate with Cloudflare: `npm run cf:login`
-4. Create configuration file: `cp config.example.jsonc config.jsonc`
-5. Edit `config.jsonc` with your API keys
-6. Deploy the Cloudflare Worker: `npm run deploy`
-7. Deploy secrets: `npm run secrets:deploy`
+```json
+{
+  "intent": "classify",
+  "model_used": "gemini-3.5-flash-lite",
+  "key_id": "key-2",
+  "result": { "content": "...", "tool_calls": [], "finish_reason": "stop" },
+  "usage": { "prompt_tokens": 34, "completion_tokens": 35, "total_tokens": 69 }
+}
+```
 
-For more detailed instructions, please refer to the [Initial Setup Guide](docs/initial-setup.md).
+`retries` is added when the request did not land first try, so quota exhaustion is
+visible rather than silently absorbed.
 
-## Environment Variables
+**Errors.** `401` no or wrong gateway key (before any upstream call). `400` unknown
+intent, malformed payload, or a request Gemini itself rejected — never a passthrough
+attempt. `429` only once **every** key on **every** candidate model for that intent is
+spent; the body lists what was tried.
 
-### Required:
+---
 
-- `PROXY_API_KEY`: API key to authenticate requests to the LLM Proxy server. (Any string can be used)
+## Setup
 
-### Cloudflare AI Gateway (Optional)
+```bash
+npm install
 
-Set these if you are using the Cloudflare AI Gateway.
+# The four Gemini keys, as a JSON array. Ids are what /debug/usage reports and
+# what the counters are keyed by, so keep them stable across deploys.
+npx wrangler secret put GEMINI_API_KEYS
+# [{"id":"key-1","key":"AIza..."},{"id":"key-2","key":"AIza..."},
+#  {"id":"key-3","key":"AIza..."},{"id":"key-4","key":"AIza..."}]
 
-- `CLOUDFLARE_ACCOUNT_ID`: Your Cloudflare account ID.
-- `AI_GATEWAY_NAME`: Name of your AI Gateway.
-- `CF_AIG_TOKEN`: (Optional) Authentication token for your AI Gateway.
+# The one key every caller presents. Unrelated to the Gemini keys.
+npx wrangler secret put HOP_GATEWAY_API_KEY   # openssl rand -hex 32
 
-### Provider API Keys
+npx wrangler deploy
+```
 
-Set the API key(s) for each provider you intend to use. API keys can be a single string, a comma-separated string, or a JSON-formatted string array.
+Optionally, for free request logging and analytics through **Cloudflare AI Gateway** —
+set all three or none; unset means calls go straight to Google:
 
-### Custom OpenAI-Compatible Endpoints (Optional)
+```bash
+npx wrangler secret put CLOUDFLARE_ACCOUNT_ID
+npx wrangler secret put AI_GATEWAY_NAME
+npx wrangler secret put CF_AIG_TOKEN
+```
 
-You can add your own OpenAI-compatible endpoints by configuring the `CUSTOM_OPENAI_ENDPOINTS` array in `config.jsonc`.
+Local dev: copy `.dev.vars.example` to `.dev.vars`, then `npm run dev`.
+Checks: `npm run gate` (tsc, lint, vitest).
 
-Example:
+### Adding a 5th, 6th, Nth key
 
-```jsonc
-"CUSTOM_OPENAI_ENDPOINTS": [
-  {
-    "name": "my-custom-llm",
-    "baseUrl": "https://llm.example.com",
-    "apiKeys": ["your-api-key"],
-    "models": ["model-1", "model-2"] // Optional, pre-defined models list for /v1/models
+Update the `GEMINI_API_KEYS` secret with the extra entry and redeploy. **No code
+changes** — nothing counts keys, and the quota table is per-key, so every limit multiplies
+by the number of keys you give it.
+
+```bash
+npx wrangler secret put GEMINI_API_KEYS   # paste the array with key-5 appended
+npx wrangler deploy
+```
+
+A key with different limits (a paid-tier one, say) goes in `KEY_OVERRIDES` in
+`src/quotas.ts`, which is consulted before `MODEL_QUOTAS`. It is empty today.
+
+---
+
+## Intents
+
+Each intent is a real call site in the Rewindly backend — see [the audit](#the-audit).
+Models are listed in preference order; the broker walks them until one has headroom.
+
+| Intent             | What it does                                | Models, in order                                                                                                       |
+| ------------------ | ------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------- |
+| `classify`         | Types a save and files it into a collection | `gemini-3.5-flash-lite` → `gemini-3.1-flash-lite` → `gemini-3.6-flash` → `gemini-3.5-flash` → `gemini-3-flash-preview` |
+| `extract`          | Pulls typed fields out of a save            | same ladder                                                                                                            |
+| `query_understand` | Expands a search query before retrieval     | same ladder                                                                                                            |
+| `chat`             | Rem's tool-calling turn                     | same ladder                                                                                                            |
+| `transcribe`       | Speech in, text out                         | `gemini-3.1-flash-lite` → `gemini-3.5-flash-lite`                                                                      |
+| `vision_describe`  | Reads an image back as text                 | `gemini-3.5-flash-lite` → `gemini-3.1-flash-lite`                                                                      |
+| `live_session`     | Mints a Live API session                    | `gemini-3.1-flash-live-preview`                                                                                        |
+
+**Why the lite models lead.** They carry 500 requests/day against the full flash models' 20. Preferring the bigger model would spend the entire day's capacity on the first twenty
+saves.
+
+**`gemini-2.5-flash` and `gemini-2.5-flash-lite` are routed to by nothing.** They are
+still returned by `GET /v1beta/models` and every call to them 404s on this account with
+_"no longer available to new users"_. They stay in `MODEL_QUOTAS` as a record of their
+console quota, and out of every candidate list.
+
+### Examples
+
+```bash
+HOP=https://api-hop.rewindly.workers.dev
+AUTH="Authorization: Bearer $HOP_GATEWAY_API_KEY"
+JSON='content-type: application/json'
+```
+
+**classify / extract / query_understand** — chat-shaped, `response_format` optional:
+
+```bash
+curl -X POST $HOP/v1/invoke -H "$AUTH" -H "$JSON" -d '{
+  "intent": "extract",
+  "payload": {
+    "messages": [{"role":"user","content":"Extract fields from: Dinner with Priya at Toit, Friday 8pm"}],
+    "response_format": {"type":"json_schema","json_schema":{"name":"extract","strict":true,
+      "schema":{"type":"object","additionalProperties":false,
+        "required":["place","people","when"],
+        "properties":{"place":{"type":"string"},
+                      "people":{"type":"array","items":{"type":"string"}},
+                      "when":{"type":"string"}}}}}
+  },
+  "options": {"temperature": 0}
+}'
+```
+
+**chat** — send `tools`, read back `tool_calls`:
+
+```bash
+curl -X POST $HOP/v1/invoke -H "$AUTH" -H "$JSON" -d '{
+  "intent": "chat",
+  "payload": {
+    "messages": [{"role":"user","content":"What did I save about ramen?"}],
+    "tools": [{"type":"function","function":{"name":"search_saves",
+      "description":"Search the saves.",
+      "parameters":{"type":"object","properties":{"query":{"type":"string"}},"required":["query"]}}}]
   }
-]
+}'
 ```
 
-Once configured, you can access the custom endpoint using its name as a pass-through route:
-
-- Pass-through: `https://your-worker-url/my-custom-llm/chat/completions`
-- OpenAI-Compatible: Use `my-custom-llm/<model-id>` as the model name in `/v1/chat/completions` (e.g., `my-custom-llm/model-1`).
-
-### Global Round-Robin Key Rotation (Optional)
-
-This feature ensures that API keys are rotated in a consistent round-robin order across all requests globally, using Cloudflare Durable Objects.
-
-- `ENABLE_GLOBAL_ROUND_ROBIN`: Set to `true` to enable this feature. (Default: `false`)
-
-> [!IMPORTANT]
-> Enabling this feature requires a Cloudflare account that supports Durable Objects.
-
-### Local Development
-
-When running locally with `npm run dev`, Wrangler automatically simulates Durable Objects.
-
-### API Key Selection via Path Parameter
-
-You can explicitly select an API key or a range for rotation by adding `/key/{index|range}/` to the start of the URL path. This bypasses the default global round-robin logic.
-
-- **Single Key:** `/key/0/v1/chat/completions` (Selects the 1st key)
-- **Range:** `/key/1-3/v1/chat/completions` (Selects a random key from index 1 to 3)
-- **Unspecified End:** `/key/2-/v1/chat/completions` (Selects a random key from index 2 to the end)
-- **Unspecified Start:** `/key/-4/v1/chat/completions` (Selects a random key from index 0 to 4)
-
-Note: Random selection within a range is stateless and uses a cryptographically secure random number generator (`crypto.randomInt`).
-
-## Usage Example
-
-Send requests to your deployed Cloudflare Worker URL with the appropriate route and API key.
-
-### OpenAI-Compatible Endpoints
-
-These endpoints are designed to be compatible with the OpenAI API.
-
-#### cURL
+**transcribe** — audio rides inline; Gemini has no `/audio/transcriptions` endpoint:
 
 ```bash
-curl https://your-worker-url/v1/models \
-  -H "Authorization: Bearer $PROXY_API_KEY" \
-  -H "Content-Type: application/json"
+curl -X POST $HOP/v1/invoke -H "$AUTH" -H "$JSON" -d "{
+  \"intent\": \"transcribe\",
+  \"payload\": {\"audio_base64\": \"$(base64 -i memo.wav)\", \"mime\": \"audio/wav\"}
+}"
+# -> {"result": {"text": "Remind me to buy paneer, spinach and kasuri methi..."}}
 ```
+
+**vision_describe** — an image as multimodal input to a text-out model:
 
 ```bash
-curl -X POST https://your-worker-url/v1/chat/completions \
-  -H "Authorization: Bearer $PROXY_API_KEY" \
-  -H "Content-Type: application/json" \
-  -d '{
-    "model": "openai/gpt-4o",
-    "messages": [{"role": "user", "content": "Hello, world!"}]
-  }'
+curl -X POST $HOP/v1/invoke -H "$AUTH" -H "$JSON" -d "{
+  \"intent\": \"vision_describe\",
+  \"payload\": {\"image_base64\": \"$(base64 -i shot.png)\", \"mime\": \"image/png\"}
+}"
+# -> {"result": {"description": "..."}}
 ```
 
-#### Python (OpenAI SDK)
-
-```Python
-from openai import OpenAI
-
-client = OpenAI(
-    api_key="PROXY_API_KEY",
-    base_url="https://your-worker-url"
-)
-models = client.models.list()
-for model in models.data:
-    print(model.id)
-```
-
-```python
-from openai import OpenAI
-
-client = OpenAI(
-    api_key="PROXY_API_KEY",
-    base_url="https://your-worker-url"
-)
-response = client.chat.completions.create(
-    model: "google-ai-studio/gemini-2.5-pro",
-    messages: [{ "role": "user", "content": "Hello, world!" }],
-)
-
-print(response.choices[0].message.content)
-```
-
-### Pass-through Endpoints
-
-Forward requests directly to the LLM provider's API using these endpoints.
-
-#### cURL
+**live_session** — returns a complete socket URL with a single-use token in it:
 
 ```bash
-curl -X POST https://your-worker-url/openai/chat/completions \
-  -H "Authorization: Bearer $PROXY_API_KEY" \
-  -H "Content-Type: application/json" \
-  -d '{
-    "model": "gpt-4o",
-    "messages": [{"role": "user", "content": "Hello, world!"}]
-  }'
+curl -X POST $HOP/v1/invoke -H "$AUTH" -H "$JSON" -d '{
+  "intent": "live_session",
+  "payload": {"setup": {
+    "generationConfig": {"responseModalities": ["AUDIO"]},
+    "systemInstruction": {"parts": [{"text": "You are Rem."}]}
+  }}
+}'
+# -> {"result": {"url": "wss://...BidiGenerateContentConstrained?access_token=...",
+#                "token": "auth_tokens/..."}}
 ```
+
+**usage**:
 
 ```bash
-curl -X POST https://your-worker-url/google-ai-studio/v1beta/models/gemini-2.5-pro:generateContent \
-  -H "Authorization: Bearer $PROXY_API_KEY" \
-  -H "Content-Type: application/json" \
-  -d '{
-    "contents": [{"role": "user", "parts": [{"text": "Hello, world!"}]}]
-  }'
+curl $HOP/debug/usage -H "$AUTH"
 ```
 
-## Documentation
+```json
+{
+  "keys": ["key-1", "key-2", "key-3", "key-4"],
+  "usage": [
+    {
+      "key_id": "key-1",
+      "model": "gemini-3.5-flash-lite",
+      "rpm_used": 15,
+      "tpm_used": 153,
+      "rpd_used": 15,
+      "blocked_for_ms": 0,
+      "limits": { "rpm": 15, "tpm": 250000, "rpd": 500 }
+    }
+  ]
+}
+```
 
-For detailed architectural and design information, please refer to the [Design Documentation](docs/design/overview.md).
+A `null` limit means unlimited — `Infinity` survives neither SQLite nor JSON.
 
-## Known Issues and Limitations
+---
 
-This project is under active development and has the following known issues and limitations:
+## How routing works
 
-- **Incomplete Provider Support:** Not all LLM providers are fully supported. Some providers may have limited feature support or may not be supported at all.
+`QuotaBroker` (`src/quota_broker.ts`) is a **Durable Object**, and that is load-bearing.
+Workers KV is eventually consistent: on a 5 RPM budget with one request of headroom left,
+two concurrent requests both read `4 used`, both decide they fit, and both fire. A DO is
+single-threaded, so the check and the increment cannot interleave. That is the whole
+mechanism, not a style preference.
+
+- **Selection.** Candidate models in preference order; within a model, the key with the
+  lowest `max(rpm_used/rpm_limit, rpd_used/rpd_limit)` among keys with headroom on RPM,
+  TPM and RPD. Not round-robin — the keys stop carrying equal usage the moment one retry
+  lands.
+- **Reservation, not tracking.** RPM and RPD increment _before_ the upstream call, with an
+  estimated token count checked against TPM. The real usage reconciles TPM afterwards.
+  This is what stops a burst all picking the same key in the gap between "checked" and
+  "used".
+- **Retry, two levels.** A 429 marks that key+model exhausted and retries with the
+  next-best key for the same model; when every key is spent, it falls through to the next
+  candidate model. Only when every key × model combination is exhausted does the caller
+  get a 429. (404 and 5xx also advance — a retired model or an overloaded one is worth
+  trying elsewhere. A 400 never does: the request is wrong and every other key rejects it
+  too.)
+- **24h disposal.** RPD resets on a rolling 24h window anchored to first use, checked
+  lazily on every read. An hourly alarm sweeps expired rows so stale counters do not
+  accumulate.
+
+**Live sessions touch the broker once.** A key is reserved at admission, the token is
+minted against it, and the socket that follows runs directly between the caller and Google
+for the length of the call. Nothing in this Worker sits in the audio path, and no Durable
+Object bills for the silence.
+
+Measured on the live deployment — 70 concurrent `classify` calls:
+
+```
+by status: { '200': 70 }
+by key:    { key-1: 17, key-2: 18, key-3: 18, key-4: 17 }
+by model:  { gemini-3.5-flash-lite: 59, gemini-3.1-flash-lite: 11 }
+first fall-through to a 2nd-choice model: request #59
+requests that saw an upstream 429: 0
+```
+
+Request #59 is exactly where 4 keys x 15 rpm exhausts the first model. Zero upstream 429s:
+the counters kept every request inside real quota.
+
+---
+
+## The audit
+
+Every AI call site in the Rewindly backend, as found on **staging and production**, before
+this gateway existed.
+
+| Call site                                   | Method                                        | Intent it becomes        |
+| ------------------------------------------- | --------------------------------------------- | ------------------------ |
+| `apps/api/src/jobs/steps.ts:317`            | `llm.completeStructured` (`classify`)         | `classify`               |
+| `apps/api/src/jobs/steps.ts:354`            | `llm.completeStructured` (`extract`)          | `extract`                |
+| `apps/api/src/routes.ts:889`, `chat.ts:108` | `llm.completeStructured` (`query_understand`) | `query_understand`       |
+| `apps/api/src/chat.ts:528`                  | `llm.converse` (tool loop)                    | `chat`                   |
+| `apps/api/src/routes.ts:1269`, `:1310`      | `llm.stream` (SSE)                            | `chat` — see Assumptions |
+| `apps/api/src/jobs/steps.ts:193`            | `transcript.transcribe` (pipeline)            | `transcribe`             |
+| `apps/api/src/routes.ts:510`                | `transcript.transcribe` (talk turn)           | `transcribe`             |
+| `apps/api/src/jobs/steps.ts:224`            | `vision.describe`                             | `vision_describe`        |
+| `apps/api/src/live.ts` `mintLiveSession`    | `POST /v1alpha/auth_tokens`                   | `live_session`           |
+| `providers.embedding`                       | mocked; `SEMANTIC_SEARCH_ENABLED=false`       | none — see Assumptions   |
+
+**Existing rotation logic found: none in the backend.** Both staging and production hold
+exactly one `LLM_API_KEY` and one `LLM_BASE_URL`. The only key-rotation code in the repo is
+`tools/provider-router/router.ts` (`keysFor` / `chainFor` / `withFailover`), a local probe
+tool that is never deployed. `apps/api/src/config-store.ts` lets the app overwrite the
+single key at runtime from D1; that is configuration, not rotation.
+
+---
+
+## Domain naming
+
+The requested hostname was `api.hop.rewindly.workers.dev`. **That shape is not achievable
+on workers.dev.** A workers.dev address is `<script-name>.<account-subdomain>.workers.dev`,
+and the script-name segment is a single DNS label — it cannot contain a dot. So the Worker
+is named `api-hop` and deploys at `api-hop.rewindly.workers.dev`.
+
+A dotted hostname like `api.hop.rewindly.<yourdomain>` is a different mechanism entirely:
+it needs the apex zone on this Cloudflare account, plus a **Custom Domain** or **Route**
+pointed at this Worker in the dashboard. Nothing in `wrangler.jsonc` can produce it.
+
+---
+
+## Credit
+
+Built from **[blue-pen5805/llm-proxy-on-cloudflare-workers](https://github.com/blue-pen5805/llm-proxy-on-cloudflare-workers)**
+(MIT). `LICENSE` and its copyright notice are retained unchanged.
+
+### What was kept
+
+- The Cloudflare Workers scaffold: `tsconfig.json`, eslint/prettier config, the CI
+  workflow, the vitest Workers pool.
+- Google AI Studio knowledge: the base URL, the OpenAI-compatible path, and the auth
+  split — `/v1beta/openai` wants `Authorization: Bearer`, native surfaces want
+  `x-goog-api-key`. Sending the wrong one is a 401 that reads like a dead key.
+- `maskUrl` / `fetch2`. Gemini's native endpoints take the key as a `?key=` parameter, so
+  an unmasked sub-request log line puts a live credential into Workers Logs.
+- The multi-shape API-key config parsing (single string / comma-separated / JSON array),
+  reimplemented in `src/config.ts` with the same semantics.
+- Cloudflare AI Gateway, as an **origin swap only** (`src/gemini.ts`). The fork also used
+  its universal endpoint to declare a fallback chain across every key at once, which is
+  exactly the decision `QuotaBroker` owns — two things choosing the key would make the
+  usage counters fiction.
+
+### What was stripped
+
+Every provider adapter and env var except Google AI Studio: OpenAI, Anthropic, Cerebras,
+Cohere, DeepSeek, Grok, Groq, Mistral, Perplexity, Azure OpenAI, Vertex AI, Amazon
+Bedrock, OpenRouter, Workers AI, HuggingFace, Replicate, Ollama, Cartesia, ElevenLabs —
+code, config schema, env vars and docs. Also gone: `CUSTOM_OPENAI_ENDPOINTS`, the
+`/key/{index|range}/` path selector, `/v1/chat/completions`, `/v1/models`, every
+provider-prefixed passthrough route, the middleware chain that existed to layer them, and
+the config-generation scripts that configured them.
+
+### What was rebuilt
+
+`QuotaBroker` (a rewrite, not an extension — the old DO was a 70-line round-robin counter
+with no line worth keeping once selection became quota-aware), the `MODEL_QUOTAS` table,
+the seven intent adapters, and the `/v1/invoke` endpoint.
+
+---
+
+## Assumptions made
+
+Decisions taken during implementation that the brief did not settle.
+
+1. **Model ids differ from the console's display names, and several had to be corrected.**
+   The brief's table was derived from console display names; a mismatch silently 404s.
+   Every id was verified against `GET /v1beta/models` and a live call on 2026-08-30.
+   Corrections: `gemini-3-flash` → `gemini-3-flash-preview`, `antigravity` →
+   `antigravity-preview-05-2026`, `gemini-embedding-1` → `gemini-embedding-001`,
+   `gemma-4-26b` → `gemma-4-26b-a4b-it`, `gemma-4-31b` → `gemma-4-31b-it`,
+   `gemini-2.5-flash-tts` → `gemini-2.5-flash-preview-tts`, `gemini-3.1-flash-tts` →
+   `gemini-3.1-flash-tts-preview`, `gemini-2.5-flash-native-audio-dialog` →
+   `gemini-2.5-flash-native-audio-latest`, `gemini-3.5-live-translate` →
+   `gemini-3.5-live-translate-preview`.
+
+2. **`gemini-3-flash-live` does not exist; its quota was mapped to
+   `gemini-3.1-flash-live-preview`.** That is the only non-native-audio Live model in the
+   3.x flash family, and it is the one talk mode is verified against. Without this mapping
+   there would be no routable Live model at all.
+
+3. **`gemini-2.5-flash` and `gemini-2.5-flash-lite` are in the quota table but in no
+   candidate list.** Both 404 on this account ("no longer available to new users") despite
+   being listed by `GET /models`. Routing to them would spend a request to be told no.
+
+4. **`gemini-3.7-flash` is a late candidate only.** It returned 503 on probe. It stays in
+   the list because 503 is transient and the retry loop advances past it.
+
+5. **No streaming through `/v1/invoke`.** The response contract is a JSON envelope with a
+   usage block, which requires reading the whole response. Of the backend's two
+   `llm.stream` call sites, one already accumulates the deltas into a string (so it loses
+   nothing), and the other only runs when Rem's tool loop hits its round ceiling without
+   settling on an answer — a rare path whose output the backend can chunk locally through
+   the `chunkForStream` it already has. Add an SSE variant if that path ever becomes
+   common.
+
+6. **No `embed` intent.** The backend's embedding provider is mocked,
+   `SEMANTIC_SEARCH_ENABLED` is `false` in both environments, and `runVectorArm()` is
+   stubbed. `gemini-embedding-001` and `gemini-embedding-2` carry quota entries so the
+   intent is a few lines when Phase 5 lands.
+
+7. **Prompts for `transcribe` and `vision_describe` default here but are
+   caller-overridable via `payload.prompt`.** Wording is product logic and belongs to the
+   backend; a default is what makes the gateway usable on its own.
+
+8. **A reservation is not released when a request fails for a non-quota reason.** The
+   counter over-counts by one. Over-counting a free tier is the safe direction, and
+   releasing correctly would mean distinguishing "Google counted this" from "it never
+   arrived", which the response does not tell us.
+
+9. **Token estimates before the call are deliberately rough** — 4 chars/token for text, a
+   flat 2,000 for media, 4,000 for a Live session. They only gate TPM in the second
+   between reserving and reconciling, and every text model here has a 250k/min budget no
+   single request approaches. Each is marked with a `ponytail:` comment naming its
+   ceiling.
+
+10. **A Live session is charged one minute of audio at admission and never reconciled** —
+    the socket bypasses this Worker, so its real usage is unobservable here. This caps
+    _concurrency_ (roughly `tpm / 4000` sessions per key), not total talk time.
+
+11. **`markExhausted` blocks a key+model for 60s without asking which limit was hit.** A
+    daily exhaustion therefore costs one wasted request per key per minute to rediscover.
+    The upgrade path is Google's `RetryInfo` on the 429 body.
+
+12. **Intent ids are `snake_case` and match the backend's existing `task` names**
+    (`classify`, `extract`, `query_understand`, `chat`) so the port is a rename, not a
+    remapping.
+
+13. **The grounding-tool budget is not tracked.** Map and search grounding carry their own
+    daily caps, layered on top of model usage. Nothing here requests grounding; a `TODO`
+    in `src/quotas.ts` marks where a counter would plug in.

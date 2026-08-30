@@ -1,43 +1,52 @@
-// This file is used to configure the Cloudflare Workers project using Wrangler.
 // Docs: https://developers.cloudflare.com/workers/wrangler/configuration/
 {
   "$schema": "node_modules/wrangler/config-schema.json",
-  "name": "llm-proxy",
+
+  // Deploys at `api-hop.<account-subdomain>.workers.dev`.
+  //
+  // The requested address was `api.hop.rewindly.workers.dev`, and that shape is
+  // not reachable this way: a workers.dev address is
+  // `<script-name>.<account-subdomain>.workers.dev`, and the script-name
+  // segment is a single DNS label with no dots in it. A dotted hostname like
+  // `api.hop.rewindly.<yourdomain>` needs the apex zone on this Cloudflare
+  // account plus a Custom Domain or Route pointed at this Worker -- a different
+  // mechanism entirely, and the README says so.
+  "name": "api-hop",
   "main": "src/index.ts",
-  // Compatibility dates
-  // Docs: https://developers.cloudflare.com/workers/configuration/compatibility-dates/
   "compatibility_date": "2026-07-16",
-  // Compatibility flags
-  // Docs: https://developers.cloudflare.com/workers/configuration/compatibility-flags/
   "compatibility_flags": ["nodejs_compat"],
-  // Workers Logs
-  // Docs: https://developers.cloudflare.com/workers/observability/logs/workers-logs/
+
   "observability": {
-    "logs": {
-      "enabled": true
-    },
-    "traces": {
-      "enabled": true,
-      "head_sampling_rate": 0.05
-    }
+    "logs": { "enabled": true },
+    "traces": { "enabled": true, "head_sampling_rate": 0.05 }
   },
-  // Smart Placement
-  // Docs: https://developers.cloudflare.com/workers/configuration/smart-placement/
-  "placement": {
-    "mode": "off"
-  },
+
+  "placement": { "mode": "off" },
+
+  // The source of truth for per-key, per-model usage. A Durable Object and not
+  // KV: two concurrent requests must not both read the same "has headroom" on a
+  // key with one request of headroom left. See src/quota_broker.ts.
   "durable_objects": {
     "bindings": [
       {
-        "name": "KEY_ROTATION_MANAGER",
-        "class_name": "KeyRotationManager"
+        "name": "QUOTA_BROKER",
+        "class_name": "QuotaBroker"
       }
     ]
   },
+
   "migrations": [
     {
-      "tag": "v1.0",
-      "new_sqlite_classes": ["KeyRotationManager"]
+      "tag": "v1",
+      "new_sqlite_classes": ["QuotaBroker"]
     }
   ]
+
+  // Secrets, set with `wrangler secret put <NAME>` and never in this file:
+  //   GEMINI_API_KEYS       JSON array of { id, key }
+  //   HOP_GATEWAY_API_KEY   the one key every caller presents
+  //
+  // Optional Cloudflare AI Gateway vars (free logging/analytics; unset means
+  // calls go straight to Google):
+  //   CLOUDFLARE_ACCOUNT_ID, AI_GATEWAY_NAME, CF_AIG_TOKEN
 }

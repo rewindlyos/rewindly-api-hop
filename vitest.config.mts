@@ -1,28 +1,19 @@
 import { cloudflareTest } from "@cloudflare/vitest-pool-workers";
-import { resolve } from "path";
 import { defineConfig } from "vitest/config";
 
 export default defineConfig({
   plugins: [
     cloudflareTest({
       wrangler: { configPath: "./wrangler.jsonc" },
+      miniflare: {
+        bindings: {
+          // Fake keys. Nothing in the suite reaches Google -- the broker tests
+          // exercise selection, and the route tests stop at 401/400/404.
+          GEMINI_API_KEYS:
+            '[{"id":"key-1","key":"t1"},{"id":"key-2","key":"t2"},{"id":"key-3","key":"t3"},{"id":"key-4","key":"t4"}]',
+          HOP_GATEWAY_API_KEY: "test-gateway-key",
+        },
+      },
     }),
   ],
-  test: {
-    alias: {
-      "~/src": resolve(__dirname, "./src"),
-    },
-    coverage: {
-      provider: "istanbul",
-      reporter: ["text", "json-summary"],
-      include: ["src/**/*.ts", "scripts/*.ts"],
-      exclude: ["src/**/*.d.ts"],
-      thresholds: {
-        statements: 100,
-        branches: 100,
-        functions: 100,
-        lines: 100,
-      },
-    },
-  },
 });

@@ -1,0 +1,9 @@
+# Copy to `.dev.vars` for local dev. `.dev.vars` is gitignored; this file is not,
+# so it must never hold a real key.
+GEMINI_API_KEYS=[{"id":"key-1","key":"AIza-your-key-1"},{"id":"key-2","key":"AIza-your-key-2"}]
+HOP_GATEWAY_API_KEY=local-dev-gateway-key
+
+# Optional Cloudflare AI Gateway (free logging + analytics). All three or none.
+CLOUDFLARE_ACCOUNT_ID=
+AI_GATEWAY_NAME=
+CF_AIG_TOKEN=
