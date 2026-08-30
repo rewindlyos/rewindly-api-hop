@@ -304,6 +304,28 @@ single key at runtime from D1; that is configuration, not rotation.
 
 ---
 
+## Calling this from another Worker
+
+A Worker on this account **cannot reach the hop by URL**. Cloudflare refuses a
+Worker-to-Worker subrequest across the same `workers.dev` zone, and answers
+`404, error code: 1042` from the edge — which reads exactly like this gateway missing a
+route, not like a platform rule. Use a service binding:
+
+```jsonc
+// the caller's wrangler config
+"services": [{ "binding": "HOP", "service": "api-hop" }]
+```
+
+```ts
+await env.HOP.fetch("https://api-hop/v1/invoke", { method: "POST", headers, body });
+```
+
+The binding ignores the hostname and routes straight to this Worker, skipping the public
+internet. The `Authorization` header still applies, so the gateway key is still required.
+
+Anything that is not a Worker on this account — `curl`, a local `wrangler dev`, a phone —
+reaches the URL normally. 1042 is Worker-to-Worker only.
+
 ## Domain naming
 
 The requested hostname was `api.hop.rewindly.workers.dev`. **That shape is not achievable

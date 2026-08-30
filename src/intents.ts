@@ -315,7 +315,10 @@ export const INTENTS: Record<string, Intent> = {
           expireTime: new Date(Date.now() + expire * 1_000).toISOString(),
           // The window to OPEN the socket, not to talk.
           newSessionExpireTime: new Date(Date.now() + connect * 1_000).toISOString(),
-          bidiGenerateContentSetup: { model: `models/${model}`, ...setup },
+          // `model` last, so it wins: the broker reserved capacity against a
+          // specific Live model and a caller's `setup.model` must not silently
+          // spend it on a different one.
+          bidiGenerateContentSetup: { ...setup, model: `models/${model}` },
         },
         timeoutMs: 30_000,
       };
