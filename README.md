@@ -121,6 +121,7 @@ Models are listed in preference order; the broker walks them until one has headr
 | `chat`             | Rem's tool-calling turn                     | same ladder                                                                                                            |
 | `transcribe`       | Speech in, text out                         | `gemini-3.1-flash-lite` → `gemini-3.5-flash-lite`                                                                      |
 | `vision_describe`  | Reads an image back as text                 | `gemini-3.5-flash-lite` → `gemini-3.1-flash-lite`                                                                      |
+| `document_read`    | Reads a whole PDF back as text, tables too  | `gemini-3.5-flash-lite` → `gemini-3.1-flash-lite`                                                                      |
 | `live_session`     | Mints a Live API session                    | `gemini-3.1-flash-live-preview`                                                                                        |
 
 **Why the lite models lead.** They carry 500 requests/day against the full flash models' 20. Preferring the bigger model would spend the entire day's capacity on the first twenty
@@ -189,6 +190,17 @@ curl -X POST $HOP/v1/invoke -H "$AUTH" -H "$JSON" -d "{
   \"payload\": {\"image_base64\": \"$(base64 -i shot.png)\", \"mime\": \"image/png\"}
 }"
 # -> {"result": {"description": "..."}}
+```
+
+**document_read** — a PDF inline, on the native `generateContent` surface (the
+OpenAI-compatible one refuses PDFs). Tables come back one row per line:
+
+```bash
+curl -X POST $HOP/v1/invoke -H "$AUTH" -H "$JSON" -d "{
+  \"intent\": \"document_read\",
+  \"payload\": {\"document_base64\": \"$(base64 -i timetable.pdf)\", \"mime\": \"application/pdf\"}
+}"
+# -> {"result": {"text": "Monday · 08:45-09:40 · Deep Learning Lab · Room L-1\n..."}}
 ```
 
 **live_session** — returns a complete socket URL with a single-use token in it:

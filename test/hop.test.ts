@@ -208,6 +208,29 @@ describe("the public surface", () => {
     expect(res.status).toBe(400);
   });
 
+  it("reads a document on the native surface, where PDFs are accepted", () => {
+    const up = INTENTS.document_read!.build(
+      "gemini-3.5-flash-lite",
+      { document_base64: "JVBERi0=", mime: "application/pdf" },
+      {},
+    );
+    expect(up.path).toBe("/v1beta/models/gemini-3.5-flash-lite:generateContent");
+    expect(JSON.stringify(up.body)).toContain('"mime_type":"application/pdf"');
+    const { result } = INTENTS.document_read!.parse({
+      candidates: [{ content: { parts: [{ text: "Monday · 08:45" }] } }],
+    });
+    expect(result).toEqual({ text: "Monday · 08:45" });
+  });
+
+  it("400s a document read with no document", async () => {
+    const res = await SELF.fetch("https://hop/v1/invoke", {
+      method: "POST",
+      headers: { authorization: `Bearer ${env.HOP_GATEWAY_API_KEY}` },
+      body: JSON.stringify({ intent: "document_read", payload: { mime: "application/pdf" } }),
+    });
+    expect(res.status).toBe(400);
+  });
+
   it("404s anything else", async () => {
     expect((await SELF.fetch("https://hop/v1/chat/completions")).status).toBe(404);
     expect((await SELF.fetch("https://hop/openai/v1/models")).status).toBe(404);
