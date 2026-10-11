@@ -56,6 +56,32 @@ stripped](#what-was-stripped).
 `retries` is added when the request did not land first try, so quota exhaustion is
 visible rather than silently absorbed.
 
+### Streaming (`chat` only)
+
+Add `"stream": true` to the request and `chat` answers as server-sent events instead of
+one JSON body. Everything before the first byte is unchanged: auth, the reservation,
+the retry walk across keys and models, and the `400` / `429` JSON errors. Only a `200`
+from Gemini becomes a stream.
+
+```
+event: delta
+data: {"content":"You saved three "}
+
+event: delta
+data: {"content":"ramen places."}
+
+event: done
+data: {"intent":"chat","model_used":"gemini-3.5-flash-lite","key_id":"key-2","result":{"content":"You saved three ramen places.","tool_calls":[],"finish_reason":"stop"},"usage":{"prompt_tokens":34,"completion_tokens":7,"total_tokens":41}}
+```
+
+`done` carries the same envelope the JSON path returns. Tool calls are not streamed:
+they arrive in pieces and are assembled into `done`'s `result.tool_calls`, thought
+signature included. Usage arrives with Gemini's last chunk, so the TPM reconcile happens
+when the stream ends, just before `done`. A stream Gemini breaks off ends with
+`event: error` (`{"message":"upstream stream failed","status":502}`) and no `done`; treat
+a stream without `done` as failed. Any other intent with `"stream": true` is a `400`.
+Callers that do not send `stream` get the JSON envelope exactly as before.
+
 **Errors.** `401` no or wrong gateway key (before any upstream call). `400` unknown
 intent, malformed payload, or a request Gemini itself rejected — never a passthrough
 attempt. `429` only once **every** key on **every** candidate model for that intent is
@@ -171,6 +197,16 @@ curl -X POST $HOP/v1/invoke -H "$AUTH" -H "$JSON" -d '{
 }'
 ```
 
+**chat, streamed** — the same request plus `"stream": true`; `-N` so curl prints each
+event as it lands:
+
+```bash
+curl -N -X POST $HOP/v1/invoke -H "$AUTH" -H "$JSON" -d '{
+  "intent": "chat", "stream": true,
+  "payload": {"messages":[{"role":"user","content":"What did I save about ramen?"}]}
+}'
+```
+
 **transcribe** — audio rides inline; Gemini has no `/audio/transcriptions` endpoint:
 
 ```bash
@@ -283,18 +319,18 @@ the counters kept every request inside real quota.
 Every AI call site in the Rewindly backend, as found on **staging and production**, before
 this gateway existed.
 
-| Call site                                   | Method                                        | Intent it becomes        |
-| ------------------------------------------- | --------------------------------------------- | ------------------------ |
-| `apps/api/src/jobs/steps.ts:317`            | `llm.completeStructured` (`classify`)         | `classify`               |
-| `apps/api/src/jobs/steps.ts:354`            | `llm.completeStructured` (`extract`)          | `extract`                |
-| `apps/api/src/routes.ts:889`, `chat.ts:108` | `llm.completeStructured` (`query_understand`) | `query_understand`       |
-| `apps/api/src/chat.ts:528`                  | `llm.converse` (tool loop)                    | `chat`                   |
-| `apps/api/src/routes.ts:1269`, `:1310`      | `llm.stream` (SSE)                            | `chat` — see Assumptions |
-| `apps/api/src/jobs/steps.ts:193`            | `transcript.transcribe` (pipeline)            | `transcribe`             |
-| `apps/api/src/routes.ts:510`                | `transcript.transcribe` (talk turn)           | `transcribe`             |
-| `apps/api/src/jobs/steps.ts:224`            | `vision.describe`                             | `vision_describe`        |
-| `apps/api/src/live.ts` `mintLiveSession`    | `POST /v1alpha/auth_tokens`                   | `live_session`           |
-| `providers.embedding`                       | mocked; `SEMANTIC_SEARCH_ENABLED=false`       | none — see Assumptions   |
+| Call site                                   | Method                                        | Intent it becomes      |
+| ------------------------------------------- | --------------------------------------------- | ---------------------- |
+| `apps/api/src/jobs/steps.ts:317`            | `llm.completeStructured` (`classify`)         | `classify`             |
+| `apps/api/src/jobs/steps.ts:354`            | `llm.completeStructured` (`extract`)          | `extract`              |
+| `apps/api/src/routes.ts:889`, `chat.ts:108` | `llm.completeStructured` (`query_understand`) | `query_understand`     |
+| `apps/api/src/chat.ts:528`                  | `llm.converse` (tool loop)                    | `chat`                 |
+| `apps/api/src/routes.ts:1269`, `:1310`      | `llm.stream` (SSE)                            | `chat`, streamed       |
+| `apps/api/src/jobs/steps.ts:193`            | `transcript.transcribe` (pipeline)            | `transcribe`           |
+| `apps/api/src/routes.ts:510`                | `transcript.transcribe` (talk turn)           | `transcribe`           |
+| `apps/api/src/jobs/steps.ts:224`            | `vision.describe`                             | `vision_describe`      |
+| `apps/api/src/live.ts` `mintLiveSession`    | `POST /v1alpha/auth_tokens`                   | `live_session`         |
+| `providers.embedding`                       | mocked; `SEMANTIC_SEARCH_ENABLED=false`       | none — see Assumptions |
 
 **Existing rotation logic found: none in the backend.** Both staging and production hold
 exactly one `LLM_API_KEY` and one `LLM_BASE_URL`. The only key-rotation code in the repo is
@@ -405,13 +441,11 @@ Decisions taken during implementation that the brief did not settle.
 4. **`gemini-3.7-flash` is a late candidate only.** It returned 503 on probe. It stays in
    the list because 503 is transient and the retry loop advances past it.
 
-5. **No streaming through `/v1/invoke`.** The response contract is a JSON envelope with a
-   usage block, which requires reading the whole response. Of the backend's two
-   `llm.stream` call sites, one already accumulates the deltas into a string (so it loses
-   nothing), and the other only runs when Rem's tool loop hits its round ceiling without
-   settling on an answer — a rare path whose output the backend can chunk locally through
-   the `chunkForStream` it already has. Add an SSE variant if that path ever becomes
-   common.
+5. **Streaming is `chat` only, and opt-in.** It was left out at first because the
+   envelope's usage block needs the whole response. It came back when Rem's answers had
+   to arrive as they are generated: the `done` event carries the same envelope, usage
+   included, once the stream ends. The other intents feed the pipeline, where nobody
+   watches the output arrive, so they stay JSON.
 
 6. **No `embed` intent.** The backend's embedding provider is mocked,
    `SEMANTIC_SEARCH_ENABLED` is `false` in both environments, and `runVectorArm()` is

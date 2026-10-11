@@ -27,12 +27,15 @@ export interface Upstream {
 export interface Intent {
   /** Candidate model ids, most preferred first. Every id must be in MODEL_QUOTAS. */
   models: string[];
+  /** Answers `"stream": true` with SSE (src/stream.ts). Only `chat` does. */
+  streams?: boolean;
   /** Tokens to charge against TPM before the call; corrected afterwards. */
   estimate(payload: Record<string, unknown>): number;
   build(
     model: string,
     payload: Record<string, unknown>,
     options: Record<string, unknown>,
+    stream?: boolean,
   ): Upstream;
   parse(json: Record<string, unknown>): { result: unknown; usage: Usage };
 }
@@ -97,7 +100,7 @@ function chatShaped(models: string[]): Intent {
       // with a tight TPM ever joins this list.
       return Math.ceil(JSON.stringify(payload.messages ?? "").length / 4);
     },
-    build(model, payload, options) {
+    build(model, payload, options, stream = false) {
       const messages = need<unknown[]>(payload, "messages", "an array");
       if (!Array.isArray(messages) || messages.length === 0) {
         throw new BadRequestError("payload.messages must be a non-empty array");
@@ -107,7 +110,9 @@ function chatShaped(models: string[]): Intent {
         body: {
           model,
           messages,
-          stream: false,
+          stream,
+          // Usage rides on the last chunk only when asked for.
+          ...(stream ? { stream_options: { include_usage: true } } : {}),
           ...(payload.response_format ? { response_format: payload.response_format } : {}),
           ...(payload.tools
             ? { tools: payload.tools, tool_choice: payload.tool_choice ?? "auto" }
@@ -145,7 +150,7 @@ interface ChatChoice {
   finish_reason?: string;
 }
 
-function readUsage(json: Record<string, unknown>): Usage {
+export function readUsage(json: Record<string, unknown>): Usage {
   const u = json.usage as
     { prompt_tokens?: number; completion_tokens?: number; total_tokens?: number } | undefined;
   const prompt = u?.prompt_tokens ?? 0;
@@ -187,8 +192,12 @@ export const INTENTS: Record<string, Intent> = {
   /** Expands a search query before retrieval runs. Structured JSON out. */
   query_understand: chatShaped(TEXT_MODELS),
 
-  /** Rem's tool-calling turn. Sends `tools`, reads back `tool_calls`. */
-  chat: chatShaped(TEXT_MODELS),
+  /**
+   * Rem's tool-calling turn. Sends `tools`, reads back `tool_calls`. The one
+   * intent that streams: Rem's answer is the only output a person watches
+   * arrive. See src/stream.ts.
+   */
+  chat: { ...chatShaped(TEXT_MODELS), streams: true },
 
   /**
    * Speech in, text out.

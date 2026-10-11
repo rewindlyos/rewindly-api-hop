@@ -1,7 +1,8 @@
 import { env, runInDurableObject, SELF } from "cloudflare:test";
-import { describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { parseApiKeys, tokenMatches } from "../src/config";
 import { INTENTS } from "../src/intents";
+import { relayChatStream } from "../src/stream";
 import { MODEL_QUOTAS } from "../src/quotas";
 import type { QuotaBroker } from "../src/quota_broker";
 
@@ -211,5 +212,217 @@ describe("the public surface", () => {
   it("404s anything else", async () => {
     expect((await SELF.fetch("https://hop/v1/chat/completions")).status).toBe(404);
     expect((await SELF.fetch("https://hop/openai/v1/models")).status).toBe(404);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Streaming chat
+// ---------------------------------------------------------------------------
+
+/** Gemini's OpenAI-compatible stream: one `data:` line per chunk, then [DONE]. */
+function upstream(chunks: unknown[], done = true): ReadableStream<Uint8Array> {
+  const text =
+    chunks.map((c) => `data: ${JSON.stringify(c)}\n\n`).join("") +
+    (done ? "data: [DONE]\n\n" : "");
+  const bytes = new TextEncoder().encode(text);
+  // Split mid-line, the way a network delivers it.
+  const cut = Math.floor(bytes.length / 2) + 3;
+  return new ReadableStream({
+    start(c) {
+      c.enqueue(bytes.slice(0, cut));
+      c.enqueue(bytes.slice(cut));
+      c.close();
+    },
+  });
+}
+
+async function frames(body: ReadableStream<Uint8Array> | null) {
+  const text = await new Response(body).text();
+  return text
+    .split("\n\n")
+    .filter(Boolean)
+    .map((block) => {
+      const event = /^event: (.*)$/m.exec(block)?.[1] ?? "message";
+      const data = /^data: (.*)$/m.exec(block)?.[1] ?? "";
+      return { event, data: JSON.parse(data) as Record<string, unknown> };
+    });
+}
+
+const delta = (d: Record<string, unknown>, finish: string | null = null) => ({
+  choices: [{ index: 0, delta: d, finish_reason: finish }],
+});
+
+const HEAD = { intent: "chat", model_used: "gemini-3.5-flash-lite", key_id: "key-1" };
+
+describe("relayChatStream", () => {
+  it("passes text on as it arrives and ends with the whole envelope and its usage", async () => {
+    const usages: unknown[] = [];
+    const out = await frames(
+      relayChatStream(
+        upstream([
+          delta({ role: "assistant", content: "You saved " }),
+          delta({ content: "three ramen places." }),
+          {
+            ...delta({}, "stop"),
+            usage: { prompt_tokens: 40, completion_tokens: 6, total_tokens: 46 },
+          },
+        ]),
+        HEAD,
+        async (u) => {
+          usages.push(u);
+        },
+      ),
+    );
+
+    expect(out.filter((f) => f.event === "delta").map((f) => f.data.content)).toEqual([
+      "You saved ",
+      "three ramen places.",
+    ]);
+    const done = out.at(-1);
+    expect(done?.event).toBe("done");
+    expect(done?.data).toEqual({
+      ...HEAD,
+      result: {
+        content: "You saved three ramen places.",
+        tool_calls: [],
+        finish_reason: "stop",
+      },
+      usage: { prompt_tokens: 40, completion_tokens: 6, total_tokens: 46 },
+    });
+    // Usage is handed over once, when the stream ends, for the broker to reconcile.
+    expect(usages).toEqual([{ prompt_tokens: 40, completion_tokens: 6, total_tokens: 46 }]);
+  });
+
+  it("assembles tool calls split across chunks, thought signature included", async () => {
+    const out = await frames(
+      relayChatStream(
+        upstream([
+          delta({
+            tool_calls: [
+              {
+                index: 0,
+                id: "call_a",
+                type: "function",
+                function: { name: "search_library", arguments: '{"query":' },
+                extra_content: { google: { thought_signature: "sig" } },
+              },
+            ],
+          }),
+          delta({ tool_calls: [{ index: 0, function: { arguments: '"ramen"}' } }] }),
+          delta({}, "tool_calls"),
+        ]),
+        HEAD,
+        async () => {},
+      ),
+    );
+
+    expect(out.some((f) => f.event === "delta")).toBe(false);
+    expect((out.at(-1)?.data.result as Record<string, unknown>).tool_calls).toEqual([
+      {
+        id: "call_a",
+        type: "function",
+        function: { name: "search_library", arguments: '{"query":"ramen"}' },
+        extra_content: { google: { thought_signature: "sig" } },
+      },
+    ]);
+  });
+
+  it("ends with an error, not a done, when the upstream stops before finishing", async () => {
+    const usages: unknown[] = [];
+    const out = await frames(
+      relayChatStream(upstream([delta({ content: "You saved" })], false), HEAD, async (u) => {
+        usages.push(u);
+      }),
+    );
+    expect(out.map((f) => f.event)).toEqual(["delta", "error"]);
+    expect(usages).toEqual([]);
+  });
+
+  it("ends with an error when the upstream sends one mid-stream", async () => {
+    const out = await frames(
+      relayChatStream(
+        upstream([delta({ content: "You" }), { error: { message: "overloaded", code: 503 } }]),
+        HEAD,
+        async () => {},
+      ),
+    );
+    expect(out.map((f) => f.event)).toEqual(["delta", "error"]);
+  });
+});
+
+describe("POST /v1/invoke with stream", () => {
+  afterEach(() => vi.restoreAllMocks());
+
+  const invoke = (body: Record<string, unknown>) =>
+    SELF.fetch("https://hop/v1/invoke", {
+      method: "POST",
+      headers: { authorization: `Bearer ${env.HOP_GATEWAY_API_KEY}` },
+      body: JSON.stringify(body),
+    });
+
+  const chatPayload = { messages: [{ role: "user", content: "what ramen did I save?" }] };
+
+  it("400s an intent that does not stream, before any upstream call", async () => {
+    const google = vi.spyOn(globalThis, "fetch");
+    const res = await invoke({ intent: "classify", payload: chatPayload, stream: true });
+    expect(res.status).toBe(400);
+    expect(JSON.stringify(await res.json())).toContain("does not stream");
+    expect(google).not.toHaveBeenCalled();
+  });
+
+  it("streams chat as SSE and reconciles the real token count when the stream ends", async () => {
+    const sent: Record<string, unknown>[] = [];
+    vi.spyOn(globalThis, "fetch").mockImplementation(async (_url, init) => {
+      sent.push(JSON.parse(String(init?.body)));
+      return new Response(
+        upstream([
+          delta({ content: "Tonkotsu" }),
+          {
+            ...delta({}, "stop"),
+            usage: { prompt_tokens: 7000, completion_tokens: 777, total_tokens: 7777 },
+          },
+        ]),
+        { headers: { "content-type": "text/event-stream" } },
+      );
+    });
+
+    const res = await invoke({ intent: "chat", payload: chatPayload, stream: true });
+
+    expect(res.status).toBe(200);
+    expect(res.headers.get("content-type")).toContain("text/event-stream");
+    const out = await frames(res.body);
+    expect(out.map((f) => f.event)).toEqual(["delta", "done"]);
+    expect(sent[0]).toMatchObject({ stream: true, stream_options: { include_usage: true } });
+
+    const done = out[1]?.data as { key_id: string; model_used: string };
+    const usage = await SELF.fetch("https://hop/debug/usage", {
+      headers: { authorization: `Bearer ${env.HOP_GATEWAY_API_KEY}` },
+    });
+    const rows = ((await usage.json()) as { usage: Array<Record<string, unknown>> }).usage;
+    expect(
+      rows.find((r) => r.key_id === done.key_id && r.model === done.model_used)?.tpm_used,
+    ).toBe(7777);
+  });
+
+  it("answers chat as one JSON envelope, exactly as before, when the caller does not ask to stream", async () => {
+    const sent: Record<string, unknown>[] = [];
+    vi.spyOn(globalThis, "fetch").mockImplementation(async (_url, init) => {
+      sent.push(JSON.parse(String(init?.body)));
+      return Response.json({
+        choices: [{ message: { content: "Tonkotsu." }, finish_reason: "stop" }],
+        usage: { prompt_tokens: 5, completion_tokens: 2, total_tokens: 7 },
+      });
+    });
+
+    const res = await invoke({ intent: "chat", payload: chatPayload });
+
+    expect(res.headers.get("content-type")).toBe("application/json");
+    expect(await res.json()).toMatchObject({
+      intent: "chat",
+      result: { content: "Tonkotsu.", tool_calls: [], finish_reason: "stop" },
+      usage: { total_tokens: 7 },
+    });
+    expect(sent[0]?.stream).toBe(false);
+    expect(sent[0]).not.toHaveProperty("stream_options");
   });
 });
