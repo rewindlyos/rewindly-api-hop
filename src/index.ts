@@ -2,6 +2,7 @@ import { bearerToken, parseApiKeys, tokenMatches } from "./config";
 import { callGemini } from "./gemini";
 import { INTENTS } from "./intents";
 import { QuotaBroker } from "./quota_broker";
+import { relayChatStream } from "./stream";
 import { AppError, BadRequestError, UnauthorizedError } from "./utils/error";
 
 export { QuotaBroker };
@@ -57,7 +58,7 @@ function worthRetrying(status: number): boolean {
 }
 
 async function invoke(request: Request, env: Env): Promise<Response> {
-  let body: { intent?: unknown; payload?: unknown; options?: unknown };
+  let body: { intent?: unknown; payload?: unknown; options?: unknown; stream?: unknown };
   try {
     body = (await request.json()) as typeof body;
   } catch {
@@ -72,6 +73,13 @@ async function invoke(request: Request, env: Env): Promise<Response> {
     throw new BadRequestError(
       `unknown intent ${JSON.stringify(name)}. Known: ${Object.keys(INTENTS).join(", ")}`,
     );
+  }
+
+  // Opt-in, per request. Every caller that does not ask gets the JSON envelope
+  // exactly as before.
+  const stream = body.stream === true;
+  if (stream && !intent.streams) {
+    throw new BadRequestError(`intent ${name} does not stream`);
   }
 
   const payload = (body.payload ?? {}) as Record<string, unknown>;
@@ -119,7 +127,7 @@ async function invoke(request: Request, env: Env): Promise<Response> {
     const { keyId, model } = reservation;
     tried.push([keyId, model]);
 
-    const upstream = intent.build(model, payload, options);
+    const upstream = intent.build(model, payload, options, stream);
     const res = await callGemini(
       upstream.path,
       upstream.body,
@@ -142,6 +150,23 @@ async function invoke(request: Request, env: Env): Promise<Response> {
       // A 400 is the caller's request, not our routing. Surfaced as-is so the
       // caller sees Gemini's own complaint rather than a laundered one.
       return json({ error: { message: detail, status: 400, model_used: model } }, 400);
+    }
+
+    // Everything above -- auth, the reservation, the retry walk, a 400 or a 429
+    // -- is the same for a stream. Only a 200 from Gemini turns into SSE.
+    if (stream && res.body) {
+      const head = {
+        intent: name,
+        model_used: model,
+        key_id: keyId,
+        ...(failures.length ? { retries: failures } : {}),
+      };
+      const body = relayChatStream(res.body, head, async (usage) => {
+        if (usage.total_tokens > 0) await hop.reconcile(keyId, model, est, usage.total_tokens);
+      });
+      return new Response(body, {
+        headers: { "content-type": "text/event-stream", "cache-control": "no-cache" },
+      });
     }
 
     const parsed = intent.parse((await res.json()) as Record<string, unknown>);
