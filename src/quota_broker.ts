@@ -1,4 +1,5 @@
 import { DurableObject } from "cloudflare:workers";
+import { dayStart } from "./budgets";
 import { MODEL_QUOTAS, quotaFor } from "./quotas";
 
 /**
@@ -279,6 +280,51 @@ export class QuotaBroker extends DurableObject {
           },
         };
       });
+  }
+
+  /**
+   * Everyone's spend today, against the one daily ceiling. Reserved at the
+   * estimate before a call and settled at the real cost after, like a person's
+   * budget (src/user_budget.ts); here because this object is already the one
+   * every call touches, and the check and the charge cannot interleave.
+   */
+  private spendToday(now: number): number {
+    this.sql.exec(
+      "CREATE TABLE IF NOT EXISTS spend (id INTEGER PRIMARY KEY CHECK (id = 1), day_win INTEGER NOT NULL, used INTEGER NOT NULL)",
+    );
+    const row = this.sql
+      .exec<{ day_win: number; used: number }>("SELECT day_win, used FROM spend WHERE id = 1")
+      .toArray()[0];
+    return row && row.day_win === dayStart(now) ? row.used : 0;
+  }
+
+  private writeSpend(used: number, now: number): void {
+    this.sql.exec(
+      `INSERT INTO spend (id, day_win, used) VALUES (1, ?, ?)
+       ON CONFLICT (id) DO UPDATE SET day_win = excluded.day_win, used = excluded.used`,
+      dayStart(now),
+      Math.max(0, used),
+    );
+  }
+
+  reserveSpend(
+    est: number,
+    ceiling: number,
+    now: number,
+  ): { ok: true } | { ok: false; retryAt: number } {
+    const used = this.spendToday(now);
+    if (used + est > ceiling) return { ok: false, retryAt: dayStart(now) + DAY };
+    this.writeSpend(used + est, now);
+    return { ok: true };
+  }
+
+  settleSpend(est: number, actual: number, now: number): void {
+    this.writeSpend(this.spendToday(now) + actual - est, now);
+  }
+
+  /** Everyone's tokens so far today, for `/debug/usage`. */
+  spentToday(now: number): number {
+    return this.spendToday(now);
   }
 
   private async armSweep(): Promise<void> {

@@ -31,6 +31,11 @@
       {
         "name": "QUOTA_BROKER",
         "class_name": "QuotaBroker"
+      },
+      // One per person: what their plan lets them spend. See src/user_budget.ts.
+      {
+        "name": "USER_BUDGET",
+        "class_name": "UserBudget"
       }
     ]
   },
@@ -39,8 +44,16 @@
     {
       "tag": "v1",
       "new_sqlite_classes": ["QuotaBroker"]
+    },
+    {
+      "tag": "v2",
+      "new_sqlite_classes": ["UserBudget"]
     }
   ]
+
+  // Budget vars, both optional (src/budgets.ts):
+  //   PLAN_LIMITS          JSON by plan: { "free": { "dailyTokens", "minuteTokens", "pipelineConcurrency" } }
+  //   GLOBAL_DAILY_TOKENS  everyone's tokens in a UTC day
 
   // Secrets, set with `wrangler secret put <NAME>` and never in this file:
   //   GEMINI_API_KEYS       JSON array of { id, key }

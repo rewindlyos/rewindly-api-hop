@@ -314,6 +314,26 @@ the counters kept every request inside real quota.
 
 ---
 
+## Budgets: per person, and one ceiling for everyone
+
+`/v1/invoke` takes three more fields from the Rewindly Worker: `user_id`, `plan` and `lane`
+(`chat`, `pipeline` or `live`). Every call is counted in tokens against that person's
+`UserBudget` (a Durable Object per person) and against one global daily ceiling held by the
+broker: reserved at the intent's estimate before the call, settled at what Google reports after.
+A person has a daily limit and a per-minute limit, and at most `pipelineConcurrency` pipeline
+calls running at once, so a big import cannot take everyone's turn. A call that never ran — no
+capacity, a 400, a payload that does not build — gives its reservation back.
+
+A refusal is a `429` with `error.reason` of `user_budget` or `global_budget` and `error.retry_at`
+(epoch ms): the next UTC midnight for a day, the next minute for a burst, a few seconds for a
+busy pipeline. The provider running out stays a `429` with no `reason`, so the caller can tell
+the two apart. A caller that sends no `user_id` (a Worker from before budgets) is served as
+before and counted only against the ceiling.
+
+The limits are provisional and counted in tokens, not money (`src/budgets.ts`). Override them
+with the `PLAN_LIMITS` var (JSON by plan) and `GLOBAL_DAILY_TOKENS`. `/debug/usage` reports
+everyone's tokens today beside the ceiling.
+
 ## The audit
 
 Every AI call site in the Rewindly backend, as found on **staging and production**, before
