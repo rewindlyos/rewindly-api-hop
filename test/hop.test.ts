@@ -223,6 +223,31 @@ describe("the public surface", () => {
     expect(result).toEqual({ text: "Monday · 08:45" });
   });
 
+  it("reads a saved video inline on the native surface, at low resolution", () => {
+    const up = INTENTS.video_read!.build(
+      "gemini-3.5-flash-lite",
+      { video_base64: "AAAAIGZ0eXA=", mime: "video/mp4" },
+      {},
+    );
+    expect(up.path).toBe("/v1beta/models/gemini-3.5-flash-lite:generateContent");
+    const body = JSON.stringify(up.body);
+    expect(body).toContain('"mime_type":"video/mp4"');
+    expect(body).toContain("MEDIA_RESOLUTION_LOW");
+    const { result } = INTENTS.video_read!.parse({
+      candidates: [{ content: { parts: [{ text: "A walk along the beach." }] } }],
+    });
+    expect(result).toEqual({ text: "A walk along the beach." });
+  });
+
+  it("400s a video read with no video", async () => {
+    const res = await SELF.fetch("https://hop/v1/invoke", {
+      method: "POST",
+      headers: { authorization: `Bearer ${env.HOP_GATEWAY_API_KEY}` },
+      body: JSON.stringify({ intent: "video_read", payload: { mime: "video/mp4" } }),
+    });
+    expect(res.status).toBe(400);
+  });
+
   it("400s a document read with no document", async () => {
     const res = await SELF.fetch("https://hop/v1/invoke", {
       method: "POST",

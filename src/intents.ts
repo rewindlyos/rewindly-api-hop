@@ -186,6 +186,12 @@ const DEFAULT_DOCUMENT_PROMPT =
   "· Room L-1'. A merged cell applies to every row it spans. Do not summarise, skip or add " +
   "anything; no markdown, no commentary.";
 
+const DEFAULT_VIDEO_PROMPT =
+  "Watch this video for a personal search index. Write, in the video's own language: " +
+  "what it is about in one or two sentences; everything said that carries information, " +
+  "close to verbatim; every piece of on-screen text, verbatim; and every specific place " +
+  "that is named or shown. Plain text, no preamble. Never invent a place or a detail.";
+
 /** A native `generateContent` response reduced to its text and usage. */
 interface NativeResponse {
   candidates?: { content?: { parts?: { text?: string }[] } }[];
@@ -351,6 +357,48 @@ export const INTENTS: Record<string, Intent> = {
           ],
           generationConfig: {
             maxOutputTokens: options.max_output_tokens ?? 8192,
+            temperature: options.temperature ?? 0,
+          },
+        },
+        timeoutMs: 120_000,
+      };
+    },
+    parse(json) {
+      const { text, usage } = readNative(json);
+      return { result: { text }, usage };
+    },
+  },
+
+  /**
+   * A video someone saved from their phone, read back as text: what it shows,
+   * what is said in it and what is written on screen. Inline bytes on native
+   * `generateContent`, like `document_read`, because the OpenAI-compatible
+   * surface takes no video. The caller keeps the file under Gemini's 20 MB
+   * inline request; a larger one would need the Files API.
+   */
+  video_read: {
+    models: ["gemini-3.5-flash-lite", "gemini-3.1-flash-lite"],
+    // ponytail: about two minutes at low media resolution (~100 tokens a
+    // second, a frame a second plus the audio), reconciled from the real count.
+    estimate: () => 12_000,
+    build(model, payload, options) {
+      const data = need<string>(payload, "video_base64", "a base64 string");
+      const mime = need<string>(payload, "mime", "a mime type");
+      return {
+        path: `/v1beta/models/${model}:generateContent`,
+        body: {
+          contents: [
+            {
+              role: "user",
+              parts: [
+                { inline_data: { mime_type: mime, data } },
+                { text: payload.prompt ?? DEFAULT_VIDEO_PROMPT },
+              ],
+            },
+          ],
+          generationConfig: {
+            mediaResolution: "MEDIA_RESOLUTION_LOW",
+            maxOutputTokens: options.max_output_tokens ?? 4096,
             temperature: options.temperature ?? 0,
           },
         },
