@@ -179,6 +179,41 @@ const DEFAULT_VISION_PROMPT =
   "Describe this image for a personal search index. State what it shows, and " +
   "transcribe any legible text verbatim. Be concise and factual. Never invent detail.";
 
+const DEFAULT_DOCUMENT_PROMPT =
+  "Write out everything this document says, as plain text, in its own language and in " +
+  "its own order. Put each heading on its own line. Write every table one row per line, " +
+  "naming each value by its column header, e.g. 'Monday · 08:45-09:40 · Deep Learning Lab " +
+  "· Room L-1'. A merged cell applies to every row it spans. Do not summarise, skip or add " +
+  "anything; no markdown, no commentary.";
+
+/** A native `generateContent` response reduced to its text and usage. */
+interface NativeResponse {
+  candidates?: { content?: { parts?: { text?: string }[] } }[];
+  usageMetadata?: {
+    promptTokenCount?: number;
+    candidatesTokenCount?: number;
+    totalTokenCount?: number;
+  };
+}
+
+function readNative(json: Record<string, unknown>): { text: string; usage: Usage } {
+  const r = json as NativeResponse;
+  const text = (r.candidates?.[0]?.content?.parts ?? [])
+    .map((p) => p.text ?? "")
+    .join("")
+    .trim();
+  const prompt = r.usageMetadata?.promptTokenCount ?? 0;
+  const completion = r.usageMetadata?.candidatesTokenCount ?? 0;
+  return {
+    text,
+    usage: {
+      prompt_tokens: prompt,
+      completion_tokens: completion,
+      total_tokens: r.usageMetadata?.totalTokenCount ?? prompt + completion,
+    },
+  };
+}
+
 export const INTENTS: Record<string, Intent> = {
   /**
    * Types a save and files it into a collection, on its way through the
@@ -282,6 +317,49 @@ export const INTENTS: Record<string, Intent> = {
       const description =
         (json.choices as ChatChoice[] | undefined)?.[0]?.message?.content ?? "";
       return { result: { description }, usage: readUsage(json) };
+    },
+  },
+
+  /**
+   * A whole document -- a PDF today -- read back as text.
+   *
+   * Native `generateContent`, not the OpenAI-compatible surface: that surface
+   * takes images and audio but refuses a PDF, and Gemini's document
+   * understanding (every page, tables with their layout) exists only here.
+   * The Rewindly Worker has no PDF parser and the phone's extractor reads none,
+   * so without this a saved timetable is indexed as its filename.
+   */
+  document_read: {
+    models: ["gemini-3.5-flash-lite", "gemini-3.1-flash-lite"],
+    // ponytail: ~258 tokens a page, so this admits a ~30-page file before the
+    // reconcile corrects it. Count pages if a long document ever trips TPM.
+    estimate: () => 8_000,
+    build(model, payload, options) {
+      const data = need<string>(payload, "document_base64", "a base64 string");
+      const mime = need<string>(payload, "mime", "a mime type");
+      return {
+        path: `/v1beta/models/${model}:generateContent`,
+        body: {
+          contents: [
+            {
+              role: "user",
+              parts: [
+                { inline_data: { mime_type: mime, data } },
+                { text: payload.prompt ?? DEFAULT_DOCUMENT_PROMPT },
+              ],
+            },
+          ],
+          generationConfig: {
+            maxOutputTokens: options.max_output_tokens ?? 8192,
+            temperature: options.temperature ?? 0,
+          },
+        },
+        timeoutMs: 120_000,
+      };
+    },
+    parse(json) {
+      const { text, usage } = readNative(json);
+      return { result: { text }, usage };
     },
   },
 
