@@ -485,48 +485,63 @@ describe("POST /v1/invoke with stream", () => {
   });
 });
 
-// Last in the file: it leaves every Gemini text pair blocked for a minute.
-describe("Inception overflow", () => {
+// Last in the file: these leave Inception pairs blocked for a minute.
+describe("Inception", () => {
   afterEach(() => vi.restoreAllMocks());
 
-  it("reaches Mercury once Gemini refuses everything, and moves past a key out of credit", async () => {
-    const mercury: Array<{ url: string; auth: string; body: Record<string, unknown> }> = [];
-    vi.spyOn(globalThis, "fetch").mockImplementation(async (input, init) => {
-      const url = String(input instanceof Request ? input.url : input);
-      if (!url.startsWith("https://api.inceptionlabs.ai/")) {
-        return new Response("quota", { status: 429 });
-      }
-      const auth = new Headers(init?.headers).get("authorization") ?? "";
-      mercury.push({ url, auth, body: JSON.parse(String(init?.body)) });
-      if (auth === "Bearer m1") return new Response("credit spent", { status: 402 });
-      return Response.json({
-        choices: [
-          { message: { content: '{"kind":"place"}', tool_calls: null }, finish_reason: "stop" },
-        ],
-        usage: { prompt_tokens: 9, completion_tokens: 4, total_tokens: 13 },
-      });
-    });
-
-    const res = await SELF.fetch("https://hop/v1/invoke", {
+  const invoke = (body: Record<string, unknown>) =>
+    SELF.fetch("https://hop/v1/invoke", {
       method: "POST",
       headers: { authorization: `Bearer ${env.HOP_GATEWAY_API_KEY}` },
-      body: JSON.stringify({
-        intent: "classify",
-        payload: { messages: [{ role: "user", content: "Ippudo, Bandra" }] },
-        options: { temperature: 0 },
-      }),
+      body: JSON.stringify(body),
     });
 
-    expect(res.status).toBe(200);
+  /** Routes fetch by host: `inception(auth, url)` answers Mercury, Gemini always says 200. */
+  function upstreams(inception: (auth: string, url: string) => Response) {
+    const calls: Array<{ url: string; auth: string; body: Record<string, unknown> }> = [];
+    vi.spyOn(globalThis, "fetch").mockImplementation(async (input, init) => {
+      const url = String(input instanceof Request ? input.url : input);
+      const auth = new Headers(init?.headers).get("authorization") ?? "";
+      calls.push({ url, auth, body: JSON.parse(String(init?.body)) });
+      if (url.startsWith("https://api.inceptionlabs.ai/")) return inception(auth, url);
+      return Response.json({
+        choices: [{ message: { content: "from gemini" }, finish_reason: "stop" }],
+        usage: { prompt_tokens: 1, completion_tokens: 1, total_tokens: 2 },
+      });
+    });
+    return calls;
+  }
+
+  it("serves text on Mercury first, moving past a key out of credit", async () => {
+    const calls = upstreams((auth) =>
+      auth === "Bearer m1"
+        ? new Response("credit spent", { status: 402 })
+        : Response.json({
+            choices: [
+              {
+                message: { content: '{"kind":"place"}', tool_calls: null },
+                finish_reason: "stop",
+              },
+            ],
+            usage: { prompt_tokens: 9, completion_tokens: 4, total_tokens: 13 },
+          }),
+    );
+
+    const res = await invoke({
+      intent: "classify",
+      payload: { messages: [{ role: "user", content: "Ippudo, Bandra" }] },
+      options: { temperature: 0 },
+    });
+
     expect(await res.json()).toMatchObject({
       model_used: "mercury-3",
       key_id: "inception-b",
       result: { content: '{"kind":"place"}', tool_calls: [] },
     });
-    expect(mercury.map((m) => m.auth)).toEqual(["Bearer m1", "Bearer m2"]);
-    expect(mercury[1]?.url).toBe("https://api.inceptionlabs.ai/v1/chat/completions");
+    expect(calls.map((c) => c.auth)).toEqual(["Bearer m1", "Bearer m2"]);
+    expect(calls[1]?.url).toBe("https://api.inceptionlabs.ai/v1/chat/completions");
     // Mercury resets a temperature below 0.5 to 1; the hop sends its floor instead.
-    expect(mercury[1]?.body.temperature).toBe(0.5);
+    expect(calls[1]?.body.temperature).toBe(0.5);
 
     const usage = await SELF.fetch("https://hop/debug/usage", {
       headers: { authorization: `Bearer ${env.HOP_GATEWAY_API_KEY}` },
@@ -534,5 +549,57 @@ describe("Inception overflow", () => {
     const rows = ((await usage.json()) as { usage: Array<Record<string, unknown>> }).usage;
     const spent = rows.find((r) => r.key_id === "inception-a" && r.model === "mercury-3");
     expect(spent?.blocked_for_ms).toBeGreaterThan(0);
+  });
+
+  it("falls back to Gemini once Mercury refuses on every key and model", async () => {
+    const calls = upstreams(() => new Response("credit spent", { status: 402 }));
+
+    const res = await invoke({
+      intent: "extract",
+      payload: { messages: [{ role: "user", content: "Ippudo, Bandra" }] },
+    });
+
+    expect(await res.json()).toMatchObject({
+      model_used: "gemini-3.5-flash-lite",
+      result: { content: "from gemini" },
+    });
+    expect(calls.filter((c) => c.url.includes("inceptionlabs")).length).toBeGreaterThan(0);
+  });
+
+  it("answers decide on Mercury Decide, passing state and questions through", async () => {
+    const calls = upstreams(() =>
+      Response.json({
+        model: "mercury-decide",
+        answers: { is_i1: { type: "noul", noul: 0.97 } },
+        usage: { input_tokens: 48, output_tokens: 1 },
+      }),
+    );
+    const questions = {
+      is_i1: { type: "noul", instructions: "Is items.i1 what `query` means?" },
+    };
+
+    const res = await invoke({
+      intent: "decide",
+      payload: { state: { query: "ramen", items: { i1: "Ippudo" } }, questions },
+    });
+
+    expect(await res.json()).toMatchObject({
+      model_used: "mercury-decide",
+      result: { answers: { is_i1: { noul: 0.97 } } },
+      usage: { prompt_tokens: 48, completion_tokens: 1, total_tokens: 49 },
+    });
+    expect(calls[0]?.url).toBe("https://api.inceptionlabs.ai/v1/decisions");
+    expect(calls[0]?.body).toEqual({
+      model: "mercury-decide",
+      state: { query: "ramen", items: { i1: "Ippudo" } },
+      questions,
+    });
+  });
+
+  it("400s a decide without questions, before any upstream call", async () => {
+    const calls = upstreams(() => new Response("unreachable", { status: 500 }));
+    const res = await invoke({ intent: "decide", payload: { state: "x", questions: {} } });
+    expect(res.status).toBe(400);
+    expect(calls).toHaveLength(0);
   });
 });

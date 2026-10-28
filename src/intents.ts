@@ -66,18 +66,20 @@ function need<T>(payload: Record<string, unknown>, key: string, kind: string): T
 // by nothing.
 // ---------------------------------------------------------------------------
 
-/** Text in, text or JSON out. The 3.x ladder, cheapest-per-day first. */
+/**
+ * Text in, text or JSON out. Inception's Mercury first (owner's call,
+ * 2026-10-28): every text call goes there, and the Gemini 3.x ladder,
+ * cheapest-per-day first, is the overflow. With `INCEPTION_API_KEYS` unset the
+ * broker finds no key for the Mercury ids and starts at Gemini, as before.
+ */
 const TEXT_MODELS = [
+  "mercury-3",
+  "mercury-2.5",
   "gemini-3.5-flash-lite",
   "gemini-3.1-flash-lite",
   "gemini-3.6-flash",
   "gemini-3.5-flash",
   "gemini-3-flash-preview",
-  // Inception, after every Gemini model: overflow for when the free tier is
-  // spent, not a replacement for it. Moving these to the front makes Mercury
-  // the primary text model with no other change.
-  "mercury-3",
-  "mercury-2.5",
 ];
 
 // ---------------------------------------------------------------------------
@@ -245,6 +247,40 @@ export const INTENTS: Record<string, Intent> = {
 
   /** Expands a search query before retrieval runs. Structured JSON out. */
   query_understand: chatShaped(TEXT_MODELS),
+
+  /**
+   * Typed questions about a shared `state`, answered as probabilities in one
+   * pass: `noul` (yes/no), `choice`, `score`, `extract`. No text is generated,
+   * and only input tokens are billed. Today's caller: reranking the hits Rem's
+   * `search_library` hands a model. `state` and `questions` pass through
+   * verbatim -- their shape is Inception's `/v1/decisions` contract.
+   */
+  decide: {
+    models: ["mercury-decide"],
+    estimate: (payload) =>
+      Math.ceil(JSON.stringify([payload.state, payload.questions]).length / 4),
+    build(model, payload) {
+      const state = need<unknown>(payload, "state", "a string, object or array");
+      const questions = need<Record<string, unknown>>(payload, "questions", "an object");
+      if (typeof questions !== "object" || Object.keys(questions).length === 0) {
+        throw new BadRequestError("payload.questions must be a non-empty object");
+      }
+      return { path: "/v1/decisions", body: { model, state, questions }, timeoutMs: 30_000 };
+    },
+    parse(json) {
+      const u = json.usage as { input_tokens?: number; output_tokens?: number } | undefined;
+      const prompt = u?.input_tokens ?? 0;
+      const completion = u?.output_tokens ?? 0;
+      return {
+        result: { answers: json.answers ?? {} },
+        usage: {
+          prompt_tokens: prompt,
+          completion_tokens: completion,
+          total_tokens: prompt + completion,
+        },
+      };
+    },
+  },
 
   /**
    * Rem's tool-calling turn. Sends `tools`, reads back `tool_calls`. The one

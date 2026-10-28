@@ -25,10 +25,11 @@ export { QuotaBroker };
 /**
  * How many (key, model) pairs one request may burn through before giving up.
  *
- * ponytail: four Gemini keys on five text models is twenty pairs, and Mercury
- * sits after all of them. When Google 429s pairs our counters still think have
- * room, a cap below that ends the walk before it reaches the overflow. Raise it
- * with the key count, or block a key on every model at once after a 429.
+ * ponytail: the text ladder is two Mercury models on every Inception key, then
+ * four Gemini keys on five models -- twenty-four pairs with two Inception keys.
+ * A cap below the pair count can end the walk before the last model is asked.
+ * Raise it with the key count, or block a key on every model at once after a
+ * 429.
  */
 const MAX_ATTEMPTS = 24;
 
@@ -71,9 +72,11 @@ function requireAuth(request: Request, env: Env): void {
  * it too -- failing over would burn the whole chain to reach the same answer
  * more slowly. Everything else is worth trying elsewhere: 429 (quota), 404 (the
  * model is retired on this project), 401/403 (that key is dead), 5xx.
+ * Inception's decisions endpoint says the same as 400 with 413 (too large) and
+ * 422 (malformed questions).
  */
 function worthRetrying(status: number): boolean {
-  return status !== 400;
+  return status !== 400 && status !== 413 && status !== 422;
 }
 
 async function invoke(request: Request, env: Env): Promise<Response> {

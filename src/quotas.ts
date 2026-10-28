@@ -84,6 +84,7 @@ export const MODEL_QUOTAS: Record<string, Quota> = {
   // back as a 402 and is handled like a 429 (index.ts).
   "mercury-3": { rpm: 1_000, tpm: 1_000_000, rpd: Infinity },
   "mercury-2.5": { rpm: 1_000, tpm: 1_000_000, rpd: Infinity },
+  "mercury-decide": { rpm: 1_000, tpm: 1_000_000, rpd: Infinity },
 };
 
 /**
