@@ -1,7 +1,9 @@
-import { bearerToken, parseApiKeys, tokenMatches } from "./config";
+import { type ApiKey, bearerToken, parseApiKeys, tokenMatches } from "./config";
 import { callGemini } from "./gemini";
+import { callInception, INCEPTION_KEY_PREFIX, isInceptionModel } from "./inception";
 import { INTENTS } from "./intents";
 import { QuotaBroker } from "./quota_broker";
+import { relayChatStream } from "./stream";
 import { AppError, BadRequestError, UnauthorizedError } from "./utils/error";
 
 export { QuotaBroker };
@@ -20,8 +22,27 @@ export { QuotaBroker };
  *   GET  /debug/usage   same auth, current counters
  */
 
-/** How many (key, model) pairs one request may burn through before giving up. */
-const MAX_ATTEMPTS = 12;
+/**
+ * How many (key, model) pairs one request may burn through before giving up.
+ *
+ * ponytail: the text ladder is two Mercury models on every Inception key, then
+ * four Gemini keys on five models -- twenty-four pairs with two Inception keys.
+ * A cap below the pair count can end the walk before the last model is asked.
+ * Raise it with the key count, or block a key on every model at once after a
+ * 429.
+ */
+const MAX_ATTEMPTS = 24;
+
+/** Every provider key. Inception's carry a prefix, so no id is ever shared. */
+function providerKeys(env: Env): ApiKey[] {
+  return [
+    ...parseApiKeys(env.GEMINI_API_KEYS),
+    ...parseApiKeys(env.INCEPTION_API_KEYS).map((k) => ({
+      id: `${INCEPTION_KEY_PREFIX}${k.id}`,
+      key: k.key,
+    })),
+  ];
+}
 
 function json(body: unknown, status = 200): Response {
   return new Response(JSON.stringify(body), {
@@ -51,13 +72,15 @@ function requireAuth(request: Request, env: Env): void {
  * it too -- failing over would burn the whole chain to reach the same answer
  * more slowly. Everything else is worth trying elsewhere: 429 (quota), 404 (the
  * model is retired on this project), 401/403 (that key is dead), 5xx.
+ * Inception's decisions endpoint says the same as 400 with 413 (too large) and
+ * 422 (malformed questions).
  */
 function worthRetrying(status: number): boolean {
-  return status !== 400;
+  return status !== 400 && status !== 413 && status !== 422;
 }
 
 async function invoke(request: Request, env: Env): Promise<Response> {
-  let body: { intent?: unknown; payload?: unknown; options?: unknown };
+  let body: { intent?: unknown; payload?: unknown; options?: unknown; stream?: unknown };
   try {
     body = (await request.json()) as typeof body;
   } catch {
@@ -74,14 +97,21 @@ async function invoke(request: Request, env: Env): Promise<Response> {
     );
   }
 
+  // Opt-in, per request. Every caller that does not ask gets the JSON envelope
+  // exactly as before.
+  const stream = body.stream === true;
+  if (stream && !intent.streams) {
+    throw new BadRequestError(`intent ${name} does not stream`);
+  }
+
   const payload = (body.payload ?? {}) as Record<string, unknown>;
   const options = (body.options ?? {}) as Record<string, unknown>;
   if (typeof payload !== "object" || Array.isArray(payload)) {
     throw new BadRequestError("payload must be an object");
   }
 
-  const keys = parseApiKeys(env.GEMINI_API_KEYS);
-  if (keys.length === 0) throw new AppError("no Gemini keys configured", 503);
+  const keys = providerKeys(env);
+  if (keys.length === 0) throw new AppError("no provider keys configured", 503);
   const keyById = new Map(keys.map((k) => [k.id, k.key]));
   const keyIds = keys.map((k) => k.id);
 
@@ -119,14 +149,11 @@ async function invoke(request: Request, env: Env): Promise<Response> {
     const { keyId, model } = reservation;
     tried.push([keyId, model]);
 
-    const upstream = intent.build(model, payload, options);
-    const res = await callGemini(
-      upstream.path,
-      upstream.body,
-      keyById.get(keyId) as string,
-      gw,
-      upstream.timeoutMs,
-    );
+    const upstream = intent.build(model, payload, options, stream);
+    const apiKey = keyById.get(keyId) as string;
+    const res = isInceptionModel(model)
+      ? await callInception(upstream.path, upstream.body, apiKey, upstream.timeoutMs)
+      : await callGemini(upstream.path, upstream.body, apiKey, gw, upstream.timeoutMs);
 
     if (!res.ok) {
       const detail = (await res.text()).slice(0, 600);
@@ -135,13 +162,32 @@ async function invoke(request: Request, env: Env): Promise<Response> {
       // 429 for a key we believed had headroom: clock drift, a stale estimate,
       // or traffic against this key from outside this system. Believe upstream
       // over the counter, and take that pair out of rotation for a minute.
-      if (res.status === 429) await hop.markExhausted(keyId, model);
+      // Inception's 402 is its token credit running out: the same treatment,
+      // at the same ponytail cost of one rediscovery a minute (quota_broker.ts).
+      if (res.status === 429 || res.status === 402) await hop.markExhausted(keyId, model);
 
       if (worthRetrying(res.status)) continue;
 
       // A 400 is the caller's request, not our routing. Surfaced as-is so the
       // caller sees Gemini's own complaint rather than a laundered one.
       return json({ error: { message: detail, status: 400, model_used: model } }, 400);
+    }
+
+    // Everything above -- auth, the reservation, the retry walk, a 400 or a 429
+    // -- is the same for a stream. Only a 200 from Gemini turns into SSE.
+    if (stream && res.body) {
+      const head = {
+        intent: name,
+        model_used: model,
+        key_id: keyId,
+        ...(failures.length ? { retries: failures } : {}),
+      };
+      const body = relayChatStream(res.body, head, async (usage) => {
+        if (usage.total_tokens > 0) await hop.reconcile(keyId, model, est, usage.total_tokens);
+      });
+      return new Response(body, {
+        headers: { "content-type": "text/event-stream", "cache-control": "no-cache" },
+      });
     }
 
     const parsed = intent.parse((await res.json()) as Record<string, unknown>);
@@ -190,7 +236,7 @@ export default {
       if (pathname === "/debug/usage") {
         requireAuth(request, env);
         return json({
-          keys: parseApiKeys(env.GEMINI_API_KEYS).map((k) => k.id),
+          keys: providerKeys(env).map((k) => k.id),
           usage: await broker(env).snapshot(),
         });
       }

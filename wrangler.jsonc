@@ -44,6 +44,7 @@
 
   // Secrets, set with `wrangler secret put <NAME>` and never in this file:
   //   GEMINI_API_KEYS       JSON array of { id, key }
+  //   INCEPTION_API_KEYS    same shape; optional Mercury overflow for text intents
   //   HOP_GATEWAY_API_KEY   the one key every caller presents
   //
   // Optional Cloudflare AI Gateway vars (free logging/analytics; unset means

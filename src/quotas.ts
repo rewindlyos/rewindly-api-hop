@@ -18,6 +18,8 @@
  * something does, it wants its own counter keyed by (key, tool) — not a column
  * on this table, since a grounded request spends from both budgets at once.
  */
+import { isInceptionKey, isInceptionModel } from "./inception";
+
 export interface Quota {
   rpm: number;
   tpm: number;
@@ -74,6 +76,15 @@ export const MODEL_QUOTAS: Record<string, Quota> = {
     rpd: Infinity,
   },
   "gemini-3.5-transcribe-live": { rpm: Infinity, tpm: 20_000, rpd: Infinity },
+
+  // --- Inception (Mercury) ---------------------------------------------
+  // Not a console quota: Inception's free-tier per-minute limits from
+  // docs.inceptionlabs.ai/get-started/rate-limits (2026-10-28), and no daily
+  // cap. What runs out is the account's one-time token credit, which comes
+  // back as a 402 and is handled like a 429 (index.ts).
+  "mercury-3": { rpm: 1_000, tpm: 1_000_000, rpd: Infinity },
+  "mercury-2.5": { rpm: 1_000, tpm: 1_000_000, rpd: Infinity },
+  "mercury-decide": { rpm: 1_000, tpm: 1_000_000, rpd: Infinity },
 };
 
 /**
@@ -86,5 +97,9 @@ export const MODEL_QUOTAS: Record<string, Quota> = {
 export const KEY_OVERRIDES: Record<string, Record<string, Quota>> = {};
 
 export function quotaFor(keyId: string, model: string): Quota | undefined {
+  // A key only serves its own provider's models. This is the one place the
+  // broker asks whether a (key, model) pair exists, so a Gemini key is never
+  // offered a Mercury model or the other way round.
+  if (isInceptionKey(keyId) !== isInceptionModel(model)) return undefined;
   return KEY_OVERRIDES?.[keyId]?.[model] ?? MODEL_QUOTAS[model];
 }

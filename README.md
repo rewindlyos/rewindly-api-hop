@@ -3,10 +3,11 @@
 The AI gateway for Rewindly. **One URL, one API key, one endpoint** — for every AI task
 the backend performs, whatever kind of task it is.
 
-The backend does not choose a Gemini model, does not hold a Gemini key, and does not know
+The backend does not choose a model, does not hold a provider key, and does not know
 how many keys exist. It names an **intent**; this Worker decides which model and which of
-our four free-tier keys serves it, against live per-key quota counters, and hops to
-another when one runs out.
+our four free-tier Gemini keys serves it, against live per-key quota counters, and hops to
+another when one runs out. The text intents go to Inception's Mercury models first, with
+Gemini as their overflow — see [Inception](#inception).
 
 Deployed at **`https://api-hop.rewindly.workers.dev`**.
 
@@ -56,6 +57,32 @@ stripped](#what-was-stripped).
 `retries` is added when the request did not land first try, so quota exhaustion is
 visible rather than silently absorbed.
 
+### Streaming (`chat` only)
+
+Add `"stream": true` to the request and `chat` answers as server-sent events instead of
+one JSON body. Everything before the first byte is unchanged: auth, the reservation,
+the retry walk across keys and models, and the `400` / `429` JSON errors. Only a `200`
+from Gemini becomes a stream.
+
+```
+event: delta
+data: {"content":"You saved three "}
+
+event: delta
+data: {"content":"ramen places."}
+
+event: done
+data: {"intent":"chat","model_used":"gemini-3.5-flash-lite","key_id":"key-2","result":{"content":"You saved three ramen places.","tool_calls":[],"finish_reason":"stop"},"usage":{"prompt_tokens":34,"completion_tokens":7,"total_tokens":41}}
+```
+
+`done` carries the same envelope the JSON path returns. Tool calls are not streamed:
+they arrive in pieces and are assembled into `done`'s `result.tool_calls`, thought
+signature included. Usage arrives with Gemini's last chunk, so the TPM reconcile happens
+when the stream ends, just before `done`. A stream Gemini breaks off ends with
+`event: error` (`{"message":"upstream stream failed","status":502}`) and no `done`; treat
+a stream without `done` as failed. Any other intent with `"stream": true` is a `400`.
+Callers that do not send `stream` get the JSON envelope exactly as before.
+
 **Errors.** `401` no or wrong gateway key (before any upstream call). `400` unknown
 intent, malformed payload, or a request Gemini itself rejected — never a passthrough
 attempt. `429` only once **every** key on **every** candidate model for that intent is
@@ -89,6 +116,14 @@ npx wrangler secret put AI_GATEWAY_NAME
 npx wrangler secret put CF_AIG_TOKEN
 ```
 
+The Inception keys that serve the text intents and `decide`. Unset, the text intents start
+at Gemini and `decide` has no capacity (same shapes as `GEMINI_API_KEYS`; ids are stored as `inception-<id>`):
+
+```bash
+npx wrangler secret put INCEPTION_API_KEYS
+# [{"id":"acct-1","key":"sk_..."},{"id":"acct-2","key":"sk_..."}]
+```
+
 Local dev: copy `.dev.vars.example` to `.dev.vars`, then `npm run dev`.
 Checks: `npm run gate` (tsc, lint, vitest).
 
@@ -113,15 +148,18 @@ A key with different limits (a paid-tier one, say) goes in `KEY_OVERRIDES` in
 Each intent is a real call site in the Rewindly backend — see [the audit](#the-audit).
 Models are listed in preference order; the broker walks them until one has headroom.
 
-| Intent             | What it does                                | Models, in order                                                                                                       |
-| ------------------ | ------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------- |
-| `classify`         | Types a save and files it into a collection | `gemini-3.5-flash-lite` → `gemini-3.1-flash-lite` → `gemini-3.6-flash` → `gemini-3.5-flash` → `gemini-3-flash-preview` |
-| `extract`          | Pulls typed fields out of a save            | same ladder                                                                                                            |
-| `query_understand` | Expands a search query before retrieval     | same ladder                                                                                                            |
-| `chat`             | Rem's tool-calling turn                     | same ladder                                                                                                            |
-| `transcribe`       | Speech in, text out                         | `gemini-3.1-flash-lite` → `gemini-3.5-flash-lite`                                                                      |
-| `vision_describe`  | Reads an image back as text                 | `gemini-3.5-flash-lite` → `gemini-3.1-flash-lite`                                                                      |
-| `live_session`     | Mints a Live API session                    | `gemini-3.1-flash-live-preview`                                                                                        |
+| Intent             | What it does                                | Models, in order                                                                                                                                     |
+| ------------------ | ------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `classify`         | Types a save and files it into a collection | `mercury-3` → `mercury-2.5` → `gemini-3.5-flash-lite` → `gemini-3.1-flash-lite` → `gemini-3.6-flash` → `gemini-3.5-flash` → `gemini-3-flash-preview` |
+| `extract`          | Pulls typed fields out of a save            | same ladder                                                                                                                                          |
+| `query_understand` | Expands a search query before retrieval     | same ladder                                                                                                                                          |
+| `decide`           | Typed questions answered as probabilities   | `mercury-decide`                                                                                                                                     |
+| `chat`             | Rem's tool-calling turn                     | same ladder                                                                                                                                          |
+| `transcribe`       | Speech in, text out                         | `gemini-3.1-flash-lite` → `gemini-3.5-flash-lite`                                                                                                    |
+| `vision_describe`  | Reads an image back as text                 | `gemini-3.5-flash-lite` → `gemini-3.1-flash-lite`                                                                                                    |
+| `document_read`    | Reads a whole PDF back as text, tables too  | `gemini-3.5-flash-lite` → `gemini-3.1-flash-lite`                                                                                                    |
+| `video_read`       | Reads a saved video back as text            | `gemini-3.5-flash-lite` → `gemini-3.1-flash-lite`                                                                                                    |
+| `live_session`     | Mints a Live API session                    | `gemini-3.1-flash-live-preview`                                                                                                                      |
 
 **Why the lite models lead.** They carry 500 requests/day against the full flash models' 20. Preferring the bigger model would spend the entire day's capacity on the first twenty
 saves.
@@ -171,6 +209,16 @@ curl -X POST $HOP/v1/invoke -H "$AUTH" -H "$JSON" -d '{
 }'
 ```
 
+**chat, streamed** — the same request plus `"stream": true`; `-N` so curl prints each
+event as it lands:
+
+```bash
+curl -N -X POST $HOP/v1/invoke -H "$AUTH" -H "$JSON" -d '{
+  "intent": "chat", "stream": true,
+  "payload": {"messages":[{"role":"user","content":"What did I save about ramen?"}]}
+}'
+```
+
 **transcribe** — audio rides inline; Gemini has no `/audio/transcriptions` endpoint:
 
 ```bash
@@ -189,6 +237,29 @@ curl -X POST $HOP/v1/invoke -H "$AUTH" -H "$JSON" -d "{
   \"payload\": {\"image_base64\": \"$(base64 -i shot.png)\", \"mime\": \"image/png\"}
 }"
 # -> {"result": {"description": "..."}}
+```
+
+**document_read** — a PDF inline, on the native `generateContent` surface (the
+OpenAI-compatible one refuses PDFs). Tables come back one row per line:
+
+```bash
+curl -X POST $HOP/v1/invoke -H "$AUTH" -H "$JSON" -d "{
+  \"intent\": \"document_read\",
+  \"payload\": {\"document_base64\": \"$(base64 -i timetable.pdf)\", \"mime\": \"application/pdf\"}
+}"
+# -> {"result": {"text": "Monday · 08:45-09:40 · Deep Learning Lab · Room L-1\n..."}}
+```
+
+**video_read** — a video from the phone, inline on the same surface, read at low media
+resolution: what it shows, what is said and what is on screen. The caller keeps it under
+the 20 MB inline request:
+
+```bash
+curl -X POST $HOP/v1/invoke -H "$AUTH" -H "$JSON" -d "{
+  \"intent\": \"video_read\",
+  \"payload\": {\"video_base64\": \"$(base64 -i clip.mp4)\", \"mime\": \"video/mp4\"}
+}"
+# -> {"result": {"text": "A walk along Juhu beach at sunset..."}}
 ```
 
 **live_session** — returns a complete socket URL with a single-use token in it:
@@ -276,6 +347,33 @@ requests that saw an upstream 429: 0
 Request #59 is exactly where 4 keys x 15 rpm exhausts the first model. Zero upstream 429s:
 the counters kept every request inside real quota.
 
+### Inception
+
+`mercury-3` and `mercury-2.5` lead the four text intents' ladder, and the Gemini 3.x models
+are their overflow. Inception's API is OpenAI-compatible, so the same request goes to
+`api.inceptionlabs.ai/v1/chat/completions` with a Bearer key (`src/inception.ts`); strict
+`json_schema`, tools and SSE all work unchanged. Two differences are handled here: Mercury
+resets a temperature outside 0.5–1 to 1, so the hop clamps it, and a spent token credit
+answers **402**, which is treated like a 429.
+
+Mercury runs at its default reasoning effort (`low` on `mercury-3`). `instant` was measured on
+2026-10-28 for `classify` and `extract` (8 saves, 2 runs, Rewindly's production prompts): twice
+as fast and 21% fewer tokens, but 3 of 16 classifications broke the schema's array limits on
+long articles and documents, and 2 of 8 saves came back in the wrong language or script. Not
+adopted.
+
+`decide` sends `state` and `questions` to `mercury-decide` on `/v1/decisions` verbatim and
+returns `answers`: `noul` probabilities, `choice`, `score`, `extract` spans. Only input
+tokens are billed. A 413 or 422 from it is the caller's request, like a 400.
+
+A key only ever serves its own provider's models (`quotaFor` in `src/quotas.ts`). Mercury
+is text-only, so `transcribe`, `vision_describe`, `document_read`, `video_read` and
+`live_session` stay on Gemini.
+
+**Inception trains on API inputs unless told not to.** Before setting `INCEPTION_API_KEYS`,
+turn off "Improve the model for everyone" under User Settings on every account whose key
+goes in.
+
 ---
 
 ## The audit
@@ -283,18 +381,18 @@ the counters kept every request inside real quota.
 Every AI call site in the Rewindly backend, as found on **staging and production**, before
 this gateway existed.
 
-| Call site                                   | Method                                        | Intent it becomes        |
-| ------------------------------------------- | --------------------------------------------- | ------------------------ |
-| `apps/api/src/jobs/steps.ts:317`            | `llm.completeStructured` (`classify`)         | `classify`               |
-| `apps/api/src/jobs/steps.ts:354`            | `llm.completeStructured` (`extract`)          | `extract`                |
-| `apps/api/src/routes.ts:889`, `chat.ts:108` | `llm.completeStructured` (`query_understand`) | `query_understand`       |
-| `apps/api/src/chat.ts:528`                  | `llm.converse` (tool loop)                    | `chat`                   |
-| `apps/api/src/routes.ts:1269`, `:1310`      | `llm.stream` (SSE)                            | `chat` — see Assumptions |
-| `apps/api/src/jobs/steps.ts:193`            | `transcript.transcribe` (pipeline)            | `transcribe`             |
-| `apps/api/src/routes.ts:510`                | `transcript.transcribe` (talk turn)           | `transcribe`             |
-| `apps/api/src/jobs/steps.ts:224`            | `vision.describe`                             | `vision_describe`        |
-| `apps/api/src/live.ts` `mintLiveSession`    | `POST /v1alpha/auth_tokens`                   | `live_session`           |
-| `providers.embedding`                       | mocked; `SEMANTIC_SEARCH_ENABLED=false`       | none — see Assumptions   |
+| Call site                                   | Method                                        | Intent it becomes      |
+| ------------------------------------------- | --------------------------------------------- | ---------------------- |
+| `apps/api/src/jobs/steps.ts:317`            | `llm.completeStructured` (`classify`)         | `classify`             |
+| `apps/api/src/jobs/steps.ts:354`            | `llm.completeStructured` (`extract`)          | `extract`              |
+| `apps/api/src/routes.ts:889`, `chat.ts:108` | `llm.completeStructured` (`query_understand`) | `query_understand`     |
+| `apps/api/src/chat.ts:528`                  | `llm.converse` (tool loop)                    | `chat`                 |
+| `apps/api/src/routes.ts:1269`, `:1310`      | `llm.stream` (SSE)                            | `chat`, streamed       |
+| `apps/api/src/jobs/steps.ts:193`            | `transcript.transcribe` (pipeline)            | `transcribe`           |
+| `apps/api/src/routes.ts:510`                | `transcript.transcribe` (talk turn)           | `transcribe`           |
+| `apps/api/src/jobs/steps.ts:224`            | `vision.describe`                             | `vision_describe`      |
+| `apps/api/src/live.ts` `mintLiveSession`    | `POST /v1alpha/auth_tokens`                   | `live_session`         |
+| `providers.embedding`                       | mocked; `SEMANTIC_SEARCH_ENABLED=false`       | none — see Assumptions |
 
 **Existing rotation logic found: none in the backend.** Both staging and production hold
 exactly one `LLM_API_KEY` and one `LLM_BASE_URL`. The only key-rotation code in the repo is
@@ -405,13 +503,11 @@ Decisions taken during implementation that the brief did not settle.
 4. **`gemini-3.7-flash` is a late candidate only.** It returned 503 on probe. It stays in
    the list because 503 is transient and the retry loop advances past it.
 
-5. **No streaming through `/v1/invoke`.** The response contract is a JSON envelope with a
-   usage block, which requires reading the whole response. Of the backend's two
-   `llm.stream` call sites, one already accumulates the deltas into a string (so it loses
-   nothing), and the other only runs when Rem's tool loop hits its round ceiling without
-   settling on an answer — a rare path whose output the backend can chunk locally through
-   the `chunkForStream` it already has. Add an SSE variant if that path ever becomes
-   common.
+5. **Streaming is `chat` only, and opt-in.** It was left out at first because the
+   envelope's usage block needs the whole response. It came back when Rem's answers had
+   to arrive as they are generated: the `done` event carries the same envelope, usage
+   included, once the stream ends. The other intents feed the pipeline, where nobody
+   watches the output arrive, so they stay JSON.
 
 6. **No `embed` intent.** The backend's embedding provider is mocked,
    `SEMANTIC_SEARCH_ENABLED` is `false` in both environments, and `runVectorArm()` is

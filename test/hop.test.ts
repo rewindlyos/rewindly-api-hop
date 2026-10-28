@@ -1,7 +1,8 @@
 import { env, runInDurableObject, SELF } from "cloudflare:test";
-import { describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { parseApiKeys, tokenMatches } from "../src/config";
 import { INTENTS } from "../src/intents";
+import { relayChatStream } from "../src/stream";
 import { MODEL_QUOTAS } from "../src/quotas";
 import type { QuotaBroker } from "../src/quota_broker";
 
@@ -163,6 +164,16 @@ describe("QuotaBroker", () => {
       expect(second!.keyId).not.toBe(first!.keyId);
     });
   });
+
+  it("never pairs a key with another provider's model", async () => {
+    await withBroker(async (b) => {
+      const mercury = ["inception-a", "inception-b"];
+      expect(await b.reserve(KEYS, ["mercury-3"], 1)).toBeNull();
+      expect(await b.reserve(mercury, ["gemini-3.5-flash-lite"], 1)).toBeNull();
+      const r = await b.reserve([...KEYS, ...mercury], ["mercury-3"], 1);
+      expect(mercury).toContain(r!.keyId);
+    });
+  });
 });
 
 describe("the public surface", () => {
@@ -208,8 +219,387 @@ describe("the public surface", () => {
     expect(res.status).toBe(400);
   });
 
+  it("reads a document on the native surface, where PDFs are accepted", () => {
+    const up = INTENTS.document_read!.build(
+      "gemini-3.5-flash-lite",
+      { document_base64: "JVBERi0=", mime: "application/pdf" },
+      {},
+    );
+    expect(up.path).toBe("/v1beta/models/gemini-3.5-flash-lite:generateContent");
+    expect(JSON.stringify(up.body)).toContain('"mime_type":"application/pdf"');
+    const { result } = INTENTS.document_read!.parse({
+      candidates: [{ content: { parts: [{ text: "Monday · 08:45" }] } }],
+    });
+    expect(result).toEqual({ text: "Monday · 08:45" });
+  });
+
+  it("reads a saved video inline on the native surface, at low resolution", () => {
+    const up = INTENTS.video_read!.build(
+      "gemini-3.5-flash-lite",
+      { video_base64: "AAAAIGZ0eXA=", mime: "video/mp4" },
+      {},
+    );
+    expect(up.path).toBe("/v1beta/models/gemini-3.5-flash-lite:generateContent");
+    const body = JSON.stringify(up.body);
+    expect(body).toContain('"mime_type":"video/mp4"');
+    expect(body).toContain("MEDIA_RESOLUTION_LOW");
+    const { result } = INTENTS.video_read!.parse({
+      candidates: [{ content: { parts: [{ text: "A walk along the beach." }] } }],
+    });
+    expect(result).toEqual({ text: "A walk along the beach." });
+  });
+
+  it("400s a video read with no video", async () => {
+    const res = await SELF.fetch("https://hop/v1/invoke", {
+      method: "POST",
+      headers: { authorization: `Bearer ${env.HOP_GATEWAY_API_KEY}` },
+      body: JSON.stringify({ intent: "video_read", payload: { mime: "video/mp4" } }),
+    });
+    expect(res.status).toBe(400);
+  });
+
+  it("400s a document read with no document", async () => {
+    const res = await SELF.fetch("https://hop/v1/invoke", {
+      method: "POST",
+      headers: { authorization: `Bearer ${env.HOP_GATEWAY_API_KEY}` },
+      body: JSON.stringify({ intent: "document_read", payload: { mime: "application/pdf" } }),
+    });
+    expect(res.status).toBe(400);
+  });
+
   it("404s anything else", async () => {
     expect((await SELF.fetch("https://hop/v1/chat/completions")).status).toBe(404);
     expect((await SELF.fetch("https://hop/openai/v1/models")).status).toBe(404);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Streaming chat
+// ---------------------------------------------------------------------------
+
+/** Gemini's OpenAI-compatible stream: one `data:` line per chunk, then [DONE]. */
+function upstream(chunks: unknown[], done = true): ReadableStream<Uint8Array> {
+  const text =
+    chunks.map((c) => `data: ${JSON.stringify(c)}\n\n`).join("") +
+    (done ? "data: [DONE]\n\n" : "");
+  const bytes = new TextEncoder().encode(text);
+  // Split mid-line, the way a network delivers it.
+  const cut = Math.floor(bytes.length / 2) + 3;
+  return new ReadableStream({
+    start(c) {
+      c.enqueue(bytes.slice(0, cut));
+      c.enqueue(bytes.slice(cut));
+      c.close();
+    },
+  });
+}
+
+async function frames(body: ReadableStream<Uint8Array> | null) {
+  const text = await new Response(body).text();
+  return text
+    .split("\n\n")
+    .filter(Boolean)
+    .map((block) => {
+      const event = /^event: (.*)$/m.exec(block)?.[1] ?? "message";
+      const data = /^data: (.*)$/m.exec(block)?.[1] ?? "";
+      return { event, data: JSON.parse(data) as Record<string, unknown> };
+    });
+}
+
+const delta = (d: Record<string, unknown>, finish: string | null = null) => ({
+  choices: [{ index: 0, delta: d, finish_reason: finish }],
+});
+
+const HEAD = { intent: "chat", model_used: "gemini-3.5-flash-lite", key_id: "key-1" };
+
+describe("relayChatStream", () => {
+  it("passes text on as it arrives and ends with the whole envelope and its usage", async () => {
+    const usages: unknown[] = [];
+    const out = await frames(
+      relayChatStream(
+        upstream([
+          delta({ role: "assistant", content: "You saved " }),
+          delta({ content: "three ramen places." }),
+          {
+            ...delta({}, "stop"),
+            usage: { prompt_tokens: 40, completion_tokens: 6, total_tokens: 46 },
+          },
+        ]),
+        HEAD,
+        async (u) => {
+          usages.push(u);
+        },
+      ),
+    );
+
+    expect(out.filter((f) => f.event === "delta").map((f) => f.data.content)).toEqual([
+      "You saved ",
+      "three ramen places.",
+    ]);
+    const done = out.at(-1);
+    expect(done?.event).toBe("done");
+    expect(done?.data).toEqual({
+      ...HEAD,
+      result: {
+        content: "You saved three ramen places.",
+        tool_calls: [],
+        finish_reason: "stop",
+      },
+      usage: { prompt_tokens: 40, completion_tokens: 6, total_tokens: 46 },
+    });
+    // Usage is handed over once, when the stream ends, for the broker to reconcile.
+    expect(usages).toEqual([{ prompt_tokens: 40, completion_tokens: 6, total_tokens: 46 }]);
+  });
+
+  it("assembles tool calls split across chunks, thought signature included", async () => {
+    const out = await frames(
+      relayChatStream(
+        upstream([
+          delta({
+            tool_calls: [
+              {
+                index: 0,
+                id: "call_a",
+                type: "function",
+                function: { name: "search_library", arguments: '{"query":' },
+                extra_content: { google: { thought_signature: "sig" } },
+              },
+            ],
+          }),
+          delta({ tool_calls: [{ index: 0, function: { arguments: '"ramen"}' } }] }),
+          delta({}, "tool_calls"),
+        ]),
+        HEAD,
+        async () => {},
+      ),
+    );
+
+    expect(out.some((f) => f.event === "delta")).toBe(false);
+    expect((out.at(-1)?.data.result as Record<string, unknown>).tool_calls).toEqual([
+      {
+        id: "call_a",
+        type: "function",
+        function: { name: "search_library", arguments: '{"query":"ramen"}' },
+        extra_content: { google: { thought_signature: "sig" } },
+      },
+    ]);
+  });
+
+  it("ends with an error, not a done, when the upstream stops before finishing", async () => {
+    const usages: unknown[] = [];
+    const out = await frames(
+      relayChatStream(upstream([delta({ content: "You saved" })], false), HEAD, async (u) => {
+        usages.push(u);
+      }),
+    );
+    expect(out.map((f) => f.event)).toEqual(["delta", "error"]);
+    expect(usages).toEqual([]);
+  });
+
+  it("ends with an error when the upstream sends one mid-stream", async () => {
+    const out = await frames(
+      relayChatStream(
+        upstream([delta({ content: "You" }), { error: { message: "overloaded", code: 503 } }]),
+        HEAD,
+        async () => {},
+      ),
+    );
+    expect(out.map((f) => f.event)).toEqual(["delta", "error"]);
+  });
+});
+
+describe("POST /v1/invoke with stream", () => {
+  afterEach(() => vi.restoreAllMocks());
+
+  const invoke = (body: Record<string, unknown>) =>
+    SELF.fetch("https://hop/v1/invoke", {
+      method: "POST",
+      headers: { authorization: `Bearer ${env.HOP_GATEWAY_API_KEY}` },
+      body: JSON.stringify(body),
+    });
+
+  const chatPayload = { messages: [{ role: "user", content: "what ramen did I save?" }] };
+
+  it("400s an intent that does not stream, before any upstream call", async () => {
+    const google = vi.spyOn(globalThis, "fetch");
+    const res = await invoke({ intent: "classify", payload: chatPayload, stream: true });
+    expect(res.status).toBe(400);
+    expect(JSON.stringify(await res.json())).toContain("does not stream");
+    expect(google).not.toHaveBeenCalled();
+  });
+
+  it("streams chat as SSE and reconciles the real token count when the stream ends", async () => {
+    const sent: Record<string, unknown>[] = [];
+    vi.spyOn(globalThis, "fetch").mockImplementation(async (_url, init) => {
+      sent.push(JSON.parse(String(init?.body)));
+      return new Response(
+        upstream([
+          delta({ content: "Tonkotsu" }),
+          {
+            ...delta({}, "stop"),
+            usage: { prompt_tokens: 7000, completion_tokens: 777, total_tokens: 7777 },
+          },
+        ]),
+        { headers: { "content-type": "text/event-stream" } },
+      );
+    });
+
+    const res = await invoke({ intent: "chat", payload: chatPayload, stream: true });
+
+    expect(res.status).toBe(200);
+    expect(res.headers.get("content-type")).toContain("text/event-stream");
+    const out = await frames(res.body);
+    expect(out.map((f) => f.event)).toEqual(["delta", "done"]);
+    expect(sent[0]).toMatchObject({ stream: true, stream_options: { include_usage: true } });
+
+    const done = out[1]?.data as { key_id: string; model_used: string };
+    const usage = await SELF.fetch("https://hop/debug/usage", {
+      headers: { authorization: `Bearer ${env.HOP_GATEWAY_API_KEY}` },
+    });
+    const rows = ((await usage.json()) as { usage: Array<Record<string, unknown>> }).usage;
+    expect(
+      rows.find((r) => r.key_id === done.key_id && r.model === done.model_used)?.tpm_used,
+    ).toBe(7777);
+  });
+
+  it("answers chat as one JSON envelope, exactly as before, when the caller does not ask to stream", async () => {
+    const sent: Record<string, unknown>[] = [];
+    vi.spyOn(globalThis, "fetch").mockImplementation(async (_url, init) => {
+      sent.push(JSON.parse(String(init?.body)));
+      return Response.json({
+        choices: [{ message: { content: "Tonkotsu." }, finish_reason: "stop" }],
+        usage: { prompt_tokens: 5, completion_tokens: 2, total_tokens: 7 },
+      });
+    });
+
+    const res = await invoke({ intent: "chat", payload: chatPayload });
+
+    expect(res.headers.get("content-type")).toBe("application/json");
+    expect(await res.json()).toMatchObject({
+      intent: "chat",
+      result: { content: "Tonkotsu.", tool_calls: [], finish_reason: "stop" },
+      usage: { total_tokens: 7 },
+    });
+    expect(sent[0]?.stream).toBe(false);
+    expect(sent[0]).not.toHaveProperty("stream_options");
+  });
+});
+
+// Last in the file: these leave Inception pairs blocked for a minute.
+describe("Inception", () => {
+  afterEach(() => vi.restoreAllMocks());
+
+  const invoke = (body: Record<string, unknown>) =>
+    SELF.fetch("https://hop/v1/invoke", {
+      method: "POST",
+      headers: { authorization: `Bearer ${env.HOP_GATEWAY_API_KEY}` },
+      body: JSON.stringify(body),
+    });
+
+  /** Routes fetch by host: `inception(auth, url)` answers Mercury, Gemini always says 200. */
+  function upstreams(inception: (auth: string, url: string) => Response) {
+    const calls: Array<{ url: string; auth: string; body: Record<string, unknown> }> = [];
+    vi.spyOn(globalThis, "fetch").mockImplementation(async (input, init) => {
+      const url = String(input instanceof Request ? input.url : input);
+      const auth = new Headers(init?.headers).get("authorization") ?? "";
+      calls.push({ url, auth, body: JSON.parse(String(init?.body)) });
+      if (url.startsWith("https://api.inceptionlabs.ai/")) return inception(auth, url);
+      return Response.json({
+        choices: [{ message: { content: "from gemini" }, finish_reason: "stop" }],
+        usage: { prompt_tokens: 1, completion_tokens: 1, total_tokens: 2 },
+      });
+    });
+    return calls;
+  }
+
+  it("serves text on Mercury first, moving past a key out of credit", async () => {
+    const calls = upstreams((auth) =>
+      auth === "Bearer m1"
+        ? new Response("credit spent", { status: 402 })
+        : Response.json({
+            choices: [
+              {
+                message: { content: '{"kind":"place"}', tool_calls: null },
+                finish_reason: "stop",
+              },
+            ],
+            usage: { prompt_tokens: 9, completion_tokens: 4, total_tokens: 13 },
+          }),
+    );
+
+    const res = await invoke({
+      intent: "classify",
+      payload: { messages: [{ role: "user", content: "Ippudo, Bandra" }] },
+      options: { temperature: 0 },
+    });
+
+    expect(await res.json()).toMatchObject({
+      model_used: "mercury-3",
+      key_id: "inception-b",
+      result: { content: '{"kind":"place"}', tool_calls: [] },
+    });
+    expect(calls.map((c) => c.auth)).toEqual(["Bearer m1", "Bearer m2"]);
+    expect(calls[1]?.url).toBe("https://api.inceptionlabs.ai/v1/chat/completions");
+    // Mercury resets a temperature below 0.5 to 1; the hop sends its floor instead.
+    expect(calls[1]?.body.temperature).toBe(0.5);
+
+    const usage = await SELF.fetch("https://hop/debug/usage", {
+      headers: { authorization: `Bearer ${env.HOP_GATEWAY_API_KEY}` },
+    });
+    const rows = ((await usage.json()) as { usage: Array<Record<string, unknown>> }).usage;
+    const spent = rows.find((r) => r.key_id === "inception-a" && r.model === "mercury-3");
+    expect(spent?.blocked_for_ms).toBeGreaterThan(0);
+  });
+
+  it("falls back to Gemini once Mercury refuses on every key and model", async () => {
+    const calls = upstreams(() => new Response("credit spent", { status: 402 }));
+
+    const res = await invoke({
+      intent: "extract",
+      payload: { messages: [{ role: "user", content: "Ippudo, Bandra" }] },
+    });
+
+    expect(await res.json()).toMatchObject({
+      model_used: "gemini-3.5-flash-lite",
+      result: { content: "from gemini" },
+    });
+    expect(calls.filter((c) => c.url.includes("inceptionlabs")).length).toBeGreaterThan(0);
+  });
+
+  it("answers decide on Mercury Decide, passing state and questions through", async () => {
+    const calls = upstreams(() =>
+      Response.json({
+        model: "mercury-decide",
+        answers: { is_i1: { type: "noul", noul: 0.97 } },
+        usage: { input_tokens: 48, output_tokens: 1 },
+      }),
+    );
+    const questions = {
+      is_i1: { type: "noul", instructions: "Is items.i1 what `query` means?" },
+    };
+
+    const res = await invoke({
+      intent: "decide",
+      payload: { state: { query: "ramen", items: { i1: "Ippudo" } }, questions },
+    });
+
+    expect(await res.json()).toMatchObject({
+      model_used: "mercury-decide",
+      result: { answers: { is_i1: { noul: 0.97 } } },
+      usage: { prompt_tokens: 48, completion_tokens: 1, total_tokens: 49 },
+    });
+    expect(calls[0]?.url).toBe("https://api.inceptionlabs.ai/v1/decisions");
+    expect(calls[0]?.body).toEqual({
+      model: "mercury-decide",
+      state: { query: "ramen", items: { i1: "Ippudo" } },
+      questions,
+    });
+  });
+
+  it("400s a decide without questions, before any upstream call", async () => {
+    const calls = upstreams(() => new Response("unreachable", { status: 500 }));
+    const res = await invoke({ intent: "decide", payload: { state: "x", questions: {} } });
+    expect(res.status).toBe(400);
+    expect(calls).toHaveLength(0);
   });
 });

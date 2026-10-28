@@ -1,5 +1,6 @@
 import { BadRequestError } from "./utils/error";
 import { liveSocketUrl } from "./gemini";
+import { isInceptionModel } from "./inception";
 
 /**
  * The task list, taken from what the Rewindly backend actually calls -- see the
@@ -27,12 +28,15 @@ export interface Upstream {
 export interface Intent {
   /** Candidate model ids, most preferred first. Every id must be in MODEL_QUOTAS. */
   models: string[];
+  /** Answers `"stream": true` with SSE (src/stream.ts). Only `chat` does. */
+  streams?: boolean;
   /** Tokens to charge against TPM before the call; corrected afterwards. */
   estimate(payload: Record<string, unknown>): number;
   build(
     model: string,
     payload: Record<string, unknown>,
     options: Record<string, unknown>,
+    stream?: boolean,
   ): Upstream;
   parse(json: Record<string, unknown>): { result: unknown; usage: Usage };
 }
@@ -62,8 +66,15 @@ function need<T>(payload: Record<string, unknown>, key: string, kind: string): T
 // by nothing.
 // ---------------------------------------------------------------------------
 
-/** Text in, text or JSON out. The 3.x ladder, cheapest-per-day first. */
+/**
+ * Text in, text or JSON out. Inception's Mercury first (owner's call,
+ * 2026-10-28): every text call goes there, and the Gemini 3.x ladder,
+ * cheapest-per-day first, is the overflow. With `INCEPTION_API_KEYS` unset the
+ * broker finds no key for the Mercury ids and starts at Gemini, as before.
+ */
 const TEXT_MODELS = [
+  "mercury-3",
+  "mercury-2.5",
   "gemini-3.5-flash-lite",
   "gemini-3.1-flash-lite",
   "gemini-3.6-flash",
@@ -97,22 +108,31 @@ function chatShaped(models: string[]): Intent {
       // with a tight TPM ever joins this list.
       return Math.ceil(JSON.stringify(payload.messages ?? "").length / 4);
     },
-    build(model, payload, options) {
+    build(model, payload, options, stream = false) {
       const messages = need<unknown[]>(payload, "messages", "an array");
       if (!Array.isArray(messages) || messages.length === 0) {
         throw new BadRequestError("payload.messages must be a non-empty array");
       }
+      const mercury = isInceptionModel(model);
+      // Mercury takes temperature in [0.5, 1] and resets anything else to 1
+      // with a warning -- the opposite of what a caller asking for 0 wanted.
+      const temperature =
+        mercury && typeof options.temperature === "number"
+          ? Math.min(1, Math.max(0.5, options.temperature))
+          : options.temperature;
       return {
-        path: "/v1beta/openai/chat/completions",
+        path: mercury ? "/v1/chat/completions" : "/v1beta/openai/chat/completions",
         body: {
           model,
           messages,
-          stream: false,
+          stream,
+          // Usage rides on the last chunk only when asked for.
+          ...(stream ? { stream_options: { include_usage: true } } : {}),
           ...(payload.response_format ? { response_format: payload.response_format } : {}),
           ...(payload.tools
             ? { tools: payload.tools, tool_choice: payload.tool_choice ?? "auto" }
             : {}),
-          ...(options.temperature !== undefined ? { temperature: options.temperature } : {}),
+          ...(temperature !== undefined ? { temperature } : {}),
           ...(options.max_output_tokens !== undefined
             ? { max_completion_tokens: options.max_output_tokens }
             : {}),
@@ -145,7 +165,7 @@ interface ChatChoice {
   finish_reason?: string;
 }
 
-function readUsage(json: Record<string, unknown>): Usage {
+export function readUsage(json: Record<string, unknown>): Usage {
   const u = json.usage as
     { prompt_tokens?: number; completion_tokens?: number; total_tokens?: number } | undefined;
   const prompt = u?.prompt_tokens ?? 0;
@@ -174,6 +194,47 @@ const DEFAULT_VISION_PROMPT =
   "Describe this image for a personal search index. State what it shows, and " +
   "transcribe any legible text verbatim. Be concise and factual. Never invent detail.";
 
+const DEFAULT_DOCUMENT_PROMPT =
+  "Write out everything this document says, as plain text, in its own language and in " +
+  "its own order. Put each heading on its own line. Write every table one row per line, " +
+  "naming each value by its column header, e.g. 'Monday · 08:45-09:40 · Deep Learning Lab " +
+  "· Room L-1'. A merged cell applies to every row it spans. Do not summarise, skip or add " +
+  "anything; no markdown, no commentary.";
+
+const DEFAULT_VIDEO_PROMPT =
+  "Watch this video for a personal search index. Write, in the video's own language: " +
+  "what it is about in one or two sentences; everything said that carries information, " +
+  "close to verbatim; every piece of on-screen text, verbatim; and every specific place " +
+  "that is named or shown. Plain text, no preamble. Never invent a place or a detail.";
+
+/** A native `generateContent` response reduced to its text and usage. */
+interface NativeResponse {
+  candidates?: { content?: { parts?: { text?: string }[] } }[];
+  usageMetadata?: {
+    promptTokenCount?: number;
+    candidatesTokenCount?: number;
+    totalTokenCount?: number;
+  };
+}
+
+function readNative(json: Record<string, unknown>): { text: string; usage: Usage } {
+  const r = json as NativeResponse;
+  const text = (r.candidates?.[0]?.content?.parts ?? [])
+    .map((p) => p.text ?? "")
+    .join("")
+    .trim();
+  const prompt = r.usageMetadata?.promptTokenCount ?? 0;
+  const completion = r.usageMetadata?.candidatesTokenCount ?? 0;
+  return {
+    text,
+    usage: {
+      prompt_tokens: prompt,
+      completion_tokens: completion,
+      total_tokens: r.usageMetadata?.totalTokenCount ?? prompt + completion,
+    },
+  };
+}
+
 export const INTENTS: Record<string, Intent> = {
   /**
    * Types a save and files it into a collection, on its way through the
@@ -187,8 +248,46 @@ export const INTENTS: Record<string, Intent> = {
   /** Expands a search query before retrieval runs. Structured JSON out. */
   query_understand: chatShaped(TEXT_MODELS),
 
-  /** Rem's tool-calling turn. Sends `tools`, reads back `tool_calls`. */
-  chat: chatShaped(TEXT_MODELS),
+  /**
+   * Typed questions about a shared `state`, answered as probabilities in one
+   * pass: `noul` (yes/no), `choice`, `score`, `extract`. No text is generated,
+   * and only input tokens are billed. Today's caller: reranking the hits Rem's
+   * `search_library` hands a model. `state` and `questions` pass through
+   * verbatim -- their shape is Inception's `/v1/decisions` contract.
+   */
+  decide: {
+    models: ["mercury-decide"],
+    estimate: (payload) =>
+      Math.ceil(JSON.stringify([payload.state, payload.questions]).length / 4),
+    build(model, payload) {
+      const state = need<unknown>(payload, "state", "a string, object or array");
+      const questions = need<Record<string, unknown>>(payload, "questions", "an object");
+      if (typeof questions !== "object" || Object.keys(questions).length === 0) {
+        throw new BadRequestError("payload.questions must be a non-empty object");
+      }
+      return { path: "/v1/decisions", body: { model, state, questions }, timeoutMs: 30_000 };
+    },
+    parse(json) {
+      const u = json.usage as { input_tokens?: number; output_tokens?: number } | undefined;
+      const prompt = u?.input_tokens ?? 0;
+      const completion = u?.output_tokens ?? 0;
+      return {
+        result: { answers: json.answers ?? {} },
+        usage: {
+          prompt_tokens: prompt,
+          completion_tokens: completion,
+          total_tokens: prompt + completion,
+        },
+      };
+    },
+  },
+
+  /**
+   * Rem's tool-calling turn. Sends `tools`, reads back `tool_calls`. The one
+   * intent that streams: Rem's answer is the only output a person watches
+   * arrive. See src/stream.ts.
+   */
+  chat: { ...chatShaped(TEXT_MODELS), streams: true },
 
   /**
    * Speech in, text out.
@@ -273,6 +372,91 @@ export const INTENTS: Record<string, Intent> = {
       const description =
         (json.choices as ChatChoice[] | undefined)?.[0]?.message?.content ?? "";
       return { result: { description }, usage: readUsage(json) };
+    },
+  },
+
+  /**
+   * A whole document -- a PDF today -- read back as text.
+   *
+   * Native `generateContent`, not the OpenAI-compatible surface: that surface
+   * takes images and audio but refuses a PDF, and Gemini's document
+   * understanding (every page, tables with their layout) exists only here.
+   * The Rewindly Worker has no PDF parser and the phone's extractor reads none,
+   * so without this a saved timetable is indexed as its filename.
+   */
+  document_read: {
+    models: ["gemini-3.5-flash-lite", "gemini-3.1-flash-lite"],
+    // ponytail: ~258 tokens a page, so this admits a ~30-page file before the
+    // reconcile corrects it. Count pages if a long document ever trips TPM.
+    estimate: () => 8_000,
+    build(model, payload, options) {
+      const data = need<string>(payload, "document_base64", "a base64 string");
+      const mime = need<string>(payload, "mime", "a mime type");
+      return {
+        path: `/v1beta/models/${model}:generateContent`,
+        body: {
+          contents: [
+            {
+              role: "user",
+              parts: [
+                { inline_data: { mime_type: mime, data } },
+                { text: payload.prompt ?? DEFAULT_DOCUMENT_PROMPT },
+              ],
+            },
+          ],
+          generationConfig: {
+            maxOutputTokens: options.max_output_tokens ?? 8192,
+            temperature: options.temperature ?? 0,
+          },
+        },
+        timeoutMs: 120_000,
+      };
+    },
+    parse(json) {
+      const { text, usage } = readNative(json);
+      return { result: { text }, usage };
+    },
+  },
+
+  /**
+   * A video someone saved from their phone, read back as text: what it shows,
+   * what is said in it and what is written on screen. Inline bytes on native
+   * `generateContent`, like `document_read`, because the OpenAI-compatible
+   * surface takes no video. The caller keeps the file under Gemini's 20 MB
+   * inline request; a larger one would need the Files API.
+   */
+  video_read: {
+    models: ["gemini-3.5-flash-lite", "gemini-3.1-flash-lite"],
+    // ponytail: about two minutes at low media resolution (~100 tokens a
+    // second, a frame a second plus the audio), reconciled from the real count.
+    estimate: () => 12_000,
+    build(model, payload, options) {
+      const data = need<string>(payload, "video_base64", "a base64 string");
+      const mime = need<string>(payload, "mime", "a mime type");
+      return {
+        path: `/v1beta/models/${model}:generateContent`,
+        body: {
+          contents: [
+            {
+              role: "user",
+              parts: [
+                { inline_data: { mime_type: mime, data } },
+                { text: payload.prompt ?? DEFAULT_VIDEO_PROMPT },
+              ],
+            },
+          ],
+          generationConfig: {
+            mediaResolution: "MEDIA_RESOLUTION_LOW",
+            maxOutputTokens: options.max_output_tokens ?? 4096,
+            temperature: options.temperature ?? 0,
+          },
+        },
+        timeoutMs: 120_000,
+      };
+    },
+    parse(json) {
+      const { text, usage } = readNative(json);
+      return { result: { text }, usage };
     },
   },
 

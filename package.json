@@ -1,6 +1,6 @@
 {
   "name": "rewindly-api-hop",
-  "description": "Rewindly's AI gateway: one endpoint and one key for every task, with quota-aware rotation across four Gemini free-tier keys.",
+  "description": "Rewindly's AI gateway: one endpoint and one key for every task, with quota-aware rotation across four Gemini free-tier keys and an Inception overflow for text.",
   "version": "0.1.0",
   "private": true,
   "type": "module",
