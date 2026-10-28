@@ -9,7 +9,10 @@ our four free-tier Gemini keys serves it, against live per-key quota counters, a
 another when one runs out. The text intents go to Inception's Mercury models first, with
 Gemini as their overflow — see [Inception](#inception).
 
-Deployed at **`https://api-hop.rewindly.workers.dev`**.
+Deployed at **`https://api-hop.rewindly.workers.dev`**, placed in **`gcp:us-central1`** rather
+than next to its caller: Gemini refuses some Cloudflare egress locations with `400
+FAILED_PRECONDITION` _"User location is not supported"_ (SIN was refused on 2026-10-28), and
+the hint covers the service binding's `fetch` the Rewindly API calls it through.
 
 ```bash
 curl -X POST https://api-hop.rewindly.workers.dev/v1/invoke \
