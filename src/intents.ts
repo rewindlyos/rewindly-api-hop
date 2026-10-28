@@ -235,6 +235,34 @@ function readNative(json: Record<string, unknown>): { text: string; usage: Usage
   };
 }
 
+/**
+ * The request `video_read` sends, however the video travels: `inline_data`
+ * from /v1/invoke, or `file_data` naming an upload from /v1/files/video_read
+ * (src/files.ts). One prompt and one generation config, so a video reads the
+ * same whichever route it took.
+ */
+export function videoReadRequest(
+  model: string,
+  videoPart: Record<string, unknown>,
+  options: Record<string, unknown> = {},
+  prompt?: unknown,
+): Upstream {
+  return {
+    path: `/v1beta/models/${model}:generateContent`,
+    body: {
+      contents: [
+        { role: "user", parts: [videoPart, { text: prompt ?? DEFAULT_VIDEO_PROMPT }] },
+      ],
+      generationConfig: {
+        mediaResolution: "MEDIA_RESOLUTION_LOW",
+        maxOutputTokens: options.max_output_tokens ?? 4096,
+        temperature: options.temperature ?? 0,
+      },
+    },
+    timeoutMs: 120_000,
+  };
+}
+
 export const INTENTS: Record<string, Intent> = {
   /**
    * Types a save and files it into a collection, on its way through the
@@ -423,7 +451,8 @@ export const INTENTS: Record<string, Intent> = {
    * what is said in it and what is written on screen. Inline bytes on native
    * `generateContent`, like `document_read`, because the OpenAI-compatible
    * surface takes no video. The caller keeps the file under Gemini's 20 MB
-   * inline request; a larger one would need the Files API.
+   * inline request; a larger one goes to `POST /v1/files/video_read`
+   * (src/files.ts), which uploads it through the Files API instead.
    */
   video_read: {
     models: ["gemini-3.5-flash-lite", "gemini-3.1-flash-lite"],
@@ -433,26 +462,12 @@ export const INTENTS: Record<string, Intent> = {
     build(model, payload, options) {
       const data = need<string>(payload, "video_base64", "a base64 string");
       const mime = need<string>(payload, "mime", "a mime type");
-      return {
-        path: `/v1beta/models/${model}:generateContent`,
-        body: {
-          contents: [
-            {
-              role: "user",
-              parts: [
-                { inline_data: { mime_type: mime, data } },
-                { text: payload.prompt ?? DEFAULT_VIDEO_PROMPT },
-              ],
-            },
-          ],
-          generationConfig: {
-            mediaResolution: "MEDIA_RESOLUTION_LOW",
-            maxOutputTokens: options.max_output_tokens ?? 4096,
-            temperature: options.temperature ?? 0,
-          },
-        },
-        timeoutMs: 120_000,
-      };
+      return videoReadRequest(
+        model,
+        { inline_data: { mime_type: mime, data } },
+        options,
+        payload.prompt,
+      );
     },
     parse(json) {
       const { text, usage } = readNative(json);

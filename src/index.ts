@@ -1,5 +1,6 @@
 import { type ApiKey, bearerToken, parseApiKeys, tokenMatches } from "./config";
-import { callGemini } from "./gemini";
+import { readVideoFile } from "./files";
+import { type AiGatewayConfig, callGemini } from "./gemini";
 import { callInception, INCEPTION_KEY_PREFIX, isInceptionModel } from "./inception";
 import { INTENTS } from "./intents";
 import { QuotaBroker } from "./quota_broker";
@@ -17,9 +18,10 @@ export { QuotaBroker };
  * never by the caller.
  *
  * Public surface:
- *   POST /v1/invoke     the only task endpoint
- *   GET  /health        no auth, liveness only
- *   GET  /debug/usage   same auth, current counters
+ *   POST /v1/invoke            every task, named by its intent
+ *   POST /v1/files/video_read  a video too big to send inline (src/files.ts)
+ *   GET  /health               no auth, liveness only
+ *   GET  /debug/usage          same auth, current counters
  */
 
 /**
@@ -56,6 +58,15 @@ function broker(env: Env): DurableObjectStub<QuotaBroker> {
   // at all -- the point is that every request on every colo sees the same
   // numbers.
   return env.QUOTA_BROKER.get(env.QUOTA_BROKER.idFromName("global"));
+}
+
+/** Cloudflare AI Gateway's optional vars; unset, every call goes straight to Google. */
+function aiGateway(env: Env): AiGatewayConfig {
+  return {
+    accountId: env.CLOUDFLARE_ACCOUNT_ID,
+    name: env.AI_GATEWAY_NAME,
+    token: env.CF_AIG_TOKEN,
+  };
 }
 
 function requireAuth(request: Request, env: Env): void {
@@ -114,12 +125,7 @@ async function invoke(request: Request, env: Env): Promise<Response> {
   if (keys.length === 0) throw new AppError("no provider keys configured", 503);
   const keyById = new Map(keys.map((k) => [k.id, k.key]));
   const keyIds = keys.map((k) => k.id);
-
-  const gw = {
-    accountId: env.CLOUDFLARE_ACCOUNT_ID,
-    name: env.AI_GATEWAY_NAME,
-    token: env.CF_AIG_TOKEN,
-  };
+  const gw = aiGateway(env);
 
   const est = intent.estimate(payload);
   const hop = broker(env);
@@ -217,7 +223,7 @@ async function invoke(request: Request, env: Env): Promise<Response> {
 }
 
 export default {
-  async fetch(request, env): Promise<Response> {
+  async fetch(request, env, ctx): Promise<Response> {
     const { pathname } = new URL(request.url);
 
     try {
@@ -231,6 +237,17 @@ export default {
         // not be able to spend a key even by accident.
         requireAuth(request, env);
         return await invoke(request, env);
+      }
+
+      if (pathname === "/v1/files/video_read") {
+        if (request.method !== "POST") throw new AppError("method not allowed", 405);
+        // As for /v1/invoke: nothing is reserved or uploaded before this.
+        requireAuth(request, env);
+        return await readVideoFile(request, ctx, {
+          keys: providerKeys(env),
+          hop: broker(env),
+          gw: aiGateway(env),
+        });
       }
 
       if (pathname === "/debug/usage") {
