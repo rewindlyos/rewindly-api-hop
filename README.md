@@ -356,6 +356,12 @@ are their overflow. Inception's API is OpenAI-compatible, so the same request go
 resets a temperature outside 0.5–1 to 1, so the hop clamps it, and a spent token credit
 answers **402**, which is treated like a 429.
 
+Mercury runs at its default reasoning effort (`low` on `mercury-3`). `instant` was measured on
+2026-10-28 for `classify` and `extract` (8 saves, 2 runs, Rewindly's production prompts): twice
+as fast and 21% fewer tokens, but 3 of 16 classifications broke the schema's array limits on
+long articles and documents, and 2 of 8 saves came back in the wrong language or script. Not
+adopted.
+
 `decide` sends `state` and `questions` to `mercury-decide` on `/v1/decisions` verbatim and
 returns `answers`: `noul` probabilities, `choice`, `score`, `extract` spans. Only input
 tokens are billed. A 413 or 422 from it is the caller's request, like a 400.
