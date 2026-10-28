@@ -164,6 +164,16 @@ describe("QuotaBroker", () => {
       expect(second!.keyId).not.toBe(first!.keyId);
     });
   });
+
+  it("never pairs a key with another provider's model", async () => {
+    await withBroker(async (b) => {
+      const mercury = ["inception-a", "inception-b"];
+      expect(await b.reserve(KEYS, ["mercury-3"], 1)).toBeNull();
+      expect(await b.reserve(mercury, ["gemini-3.5-flash-lite"], 1)).toBeNull();
+      const r = await b.reserve([...KEYS, ...mercury], ["mercury-3"], 1);
+      expect(mercury).toContain(r!.keyId);
+    });
+  });
 });
 
 describe("the public surface", () => {
@@ -472,5 +482,57 @@ describe("POST /v1/invoke with stream", () => {
     });
     expect(sent[0]?.stream).toBe(false);
     expect(sent[0]).not.toHaveProperty("stream_options");
+  });
+});
+
+// Last in the file: it leaves every Gemini text pair blocked for a minute.
+describe("Inception overflow", () => {
+  afterEach(() => vi.restoreAllMocks());
+
+  it("reaches Mercury once Gemini refuses everything, and moves past a key out of credit", async () => {
+    const mercury: Array<{ url: string; auth: string; body: Record<string, unknown> }> = [];
+    vi.spyOn(globalThis, "fetch").mockImplementation(async (input, init) => {
+      const url = String(input instanceof Request ? input.url : input);
+      if (!url.startsWith("https://api.inceptionlabs.ai/")) {
+        return new Response("quota", { status: 429 });
+      }
+      const auth = new Headers(init?.headers).get("authorization") ?? "";
+      mercury.push({ url, auth, body: JSON.parse(String(init?.body)) });
+      if (auth === "Bearer m1") return new Response("credit spent", { status: 402 });
+      return Response.json({
+        choices: [
+          { message: { content: '{"kind":"place"}', tool_calls: null }, finish_reason: "stop" },
+        ],
+        usage: { prompt_tokens: 9, completion_tokens: 4, total_tokens: 13 },
+      });
+    });
+
+    const res = await SELF.fetch("https://hop/v1/invoke", {
+      method: "POST",
+      headers: { authorization: `Bearer ${env.HOP_GATEWAY_API_KEY}` },
+      body: JSON.stringify({
+        intent: "classify",
+        payload: { messages: [{ role: "user", content: "Ippudo, Bandra" }] },
+        options: { temperature: 0 },
+      }),
+    });
+
+    expect(res.status).toBe(200);
+    expect(await res.json()).toMatchObject({
+      model_used: "mercury-3",
+      key_id: "inception-b",
+      result: { content: '{"kind":"place"}', tool_calls: [] },
+    });
+    expect(mercury.map((m) => m.auth)).toEqual(["Bearer m1", "Bearer m2"]);
+    expect(mercury[1]?.url).toBe("https://api.inceptionlabs.ai/v1/chat/completions");
+    // Mercury resets a temperature below 0.5 to 1; the hop sends its floor instead.
+    expect(mercury[1]?.body.temperature).toBe(0.5);
+
+    const usage = await SELF.fetch("https://hop/debug/usage", {
+      headers: { authorization: `Bearer ${env.HOP_GATEWAY_API_KEY}` },
+    });
+    const rows = ((await usage.json()) as { usage: Array<Record<string, unknown>> }).usage;
+    const spent = rows.find((r) => r.key_id === "inception-a" && r.model === "mercury-3");
+    expect(spent?.blocked_for_ms).toBeGreaterThan(0);
   });
 });

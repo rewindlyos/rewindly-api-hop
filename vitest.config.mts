@@ -11,6 +11,7 @@ export default defineConfig({
           // exercise selection, and the route tests stop at 401/400/404.
           GEMINI_API_KEYS:
             '[{"id":"key-1","key":"t1"},{"id":"key-2","key":"t2"},{"id":"key-3","key":"t3"},{"id":"key-4","key":"t4"}]',
+          INCEPTION_API_KEYS: '[{"id":"a","key":"m1"},{"id":"b","key":"m2"}]',
           HOP_GATEWAY_API_KEY: "test-gateway-key",
         },
       },

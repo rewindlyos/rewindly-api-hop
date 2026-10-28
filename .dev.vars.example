@@ -3,6 +3,10 @@
 GEMINI_API_KEYS=[{"id":"key-1","key":"AIza-your-key-1"},{"id":"key-2","key":"AIza-your-key-2"}]
 HOP_GATEWAY_API_KEY=local-dev-gateway-key
 
+# Optional Inception (Mercury) keys, same shapes as GEMINI_API_KEYS. Empty means
+# the text intents have no overflow past Gemini.
+INCEPTION_API_KEYS=
+
 # Optional Cloudflare AI Gateway (free logging + analytics). All three or none.
 CLOUDFLARE_ACCOUNT_ID=
 AI_GATEWAY_NAME=

@@ -3,10 +3,11 @@
 The AI gateway for Rewindly. **One URL, one API key, one endpoint** — for every AI task
 the backend performs, whatever kind of task it is.
 
-The backend does not choose a Gemini model, does not hold a Gemini key, and does not know
+The backend does not choose a model, does not hold a provider key, and does not know
 how many keys exist. It names an **intent**; this Worker decides which model and which of
-our four free-tier keys serves it, against live per-key quota counters, and hops to
-another when one runs out.
+our four free-tier Gemini keys serves it, against live per-key quota counters, and hops to
+another when one runs out. The text intents overflow to Inception's Mercury models when
+every Gemini key is spent — see [Inception overflow](#inception-overflow).
 
 Deployed at **`https://api-hop.rewindly.workers.dev`**.
 
@@ -115,6 +116,14 @@ npx wrangler secret put AI_GATEWAY_NAME
 npx wrangler secret put CF_AIG_TOKEN
 ```
 
+Optionally, the Inception keys that give the text intents somewhere to go once Gemini is
+spent (same shapes as `GEMINI_API_KEYS`; ids are stored as `inception-<id>`):
+
+```bash
+npx wrangler secret put INCEPTION_API_KEYS
+# [{"id":"acct-1","key":"sk_..."},{"id":"acct-2","key":"sk_..."}]
+```
+
 Local dev: copy `.dev.vars.example` to `.dev.vars`, then `npm run dev`.
 Checks: `npm run gate` (tsc, lint, vitest).
 
@@ -139,17 +148,17 @@ A key with different limits (a paid-tier one, say) goes in `KEY_OVERRIDES` in
 Each intent is a real call site in the Rewindly backend — see [the audit](#the-audit).
 Models are listed in preference order; the broker walks them until one has headroom.
 
-| Intent             | What it does                                | Models, in order                                                                                                       |
-| ------------------ | ------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------- |
-| `classify`         | Types a save and files it into a collection | `gemini-3.5-flash-lite` → `gemini-3.1-flash-lite` → `gemini-3.6-flash` → `gemini-3.5-flash` → `gemini-3-flash-preview` |
-| `extract`          | Pulls typed fields out of a save            | same ladder                                                                                                            |
-| `query_understand` | Expands a search query before retrieval     | same ladder                                                                                                            |
-| `chat`             | Rem's tool-calling turn                     | same ladder                                                                                                            |
-| `transcribe`       | Speech in, text out                         | `gemini-3.1-flash-lite` → `gemini-3.5-flash-lite`                                                                      |
-| `vision_describe`  | Reads an image back as text                 | `gemini-3.5-flash-lite` → `gemini-3.1-flash-lite`                                                                      |
-| `document_read`    | Reads a whole PDF back as text, tables too  | `gemini-3.5-flash-lite` → `gemini-3.1-flash-lite`                                                                      |
-| `video_read`       | Reads a saved video back as text            | `gemini-3.5-flash-lite` → `gemini-3.1-flash-lite`                                                                      |
-| `live_session`     | Mints a Live API session                    | `gemini-3.1-flash-live-preview`                                                                                        |
+| Intent             | What it does                                | Models, in order                                                                                                                                     |
+| ------------------ | ------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `classify`         | Types a save and files it into a collection | `gemini-3.5-flash-lite` → `gemini-3.1-flash-lite` → `gemini-3.6-flash` → `gemini-3.5-flash` → `gemini-3-flash-preview` → `mercury-3` → `mercury-2.5` |
+| `extract`          | Pulls typed fields out of a save            | same ladder                                                                                                                                          |
+| `query_understand` | Expands a search query before retrieval     | same ladder                                                                                                                                          |
+| `chat`             | Rem's tool-calling turn                     | same ladder                                                                                                                                          |
+| `transcribe`       | Speech in, text out                         | `gemini-3.1-flash-lite` → `gemini-3.5-flash-lite`                                                                                                    |
+| `vision_describe`  | Reads an image back as text                 | `gemini-3.5-flash-lite` → `gemini-3.1-flash-lite`                                                                                                    |
+| `document_read`    | Reads a whole PDF back as text, tables too  | `gemini-3.5-flash-lite` → `gemini-3.1-flash-lite`                                                                                                    |
+| `video_read`       | Reads a saved video back as text            | `gemini-3.5-flash-lite` → `gemini-3.1-flash-lite`                                                                                                    |
+| `live_session`     | Mints a Live API session                    | `gemini-3.1-flash-live-preview`                                                                                                                      |
 
 **Why the lite models lead.** They carry 500 requests/day against the full flash models' 20. Preferring the bigger model would spend the entire day's capacity on the first twenty
 saves.
@@ -336,6 +345,24 @@ requests that saw an upstream 429: 0
 
 Request #59 is exactly where 4 keys x 15 rpm exhausts the first model. Zero upstream 429s:
 the counters kept every request inside real quota.
+
+### Inception overflow
+
+`mercury-3` and `mercury-2.5` sit at the end of the four text intents' ladder, so they
+serve only what no Gemini key can. Inception's API is OpenAI-compatible, so the same
+request goes to `api.inceptionlabs.ai/v1/chat/completions` with a Bearer key
+(`src/inception.ts`); strict `json_schema`, tools and SSE all work unchanged. Two
+differences are handled here: Mercury resets a temperature outside 0.5–1 to 1, so the hop
+clamps it, and a spent token credit answers **402**, which is treated like a 429.
+
+A key only ever serves its own provider's models (`quotaFor` in `src/quotas.ts`). Mercury
+is text-only, so `transcribe`, `vision_describe`, `document_read`, `video_read` and
+`live_session` have no overflow. Moving the two ids to the front of `TEXT_MODELS` makes
+Mercury the primary text model.
+
+**Inception trains on API inputs unless told not to.** Before setting `INCEPTION_API_KEYS`,
+turn off "Improve the model for everyone" under User Settings on every account whose key
+goes in.
 
 ---
 

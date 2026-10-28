@@ -1,5 +1,6 @@
 import { BadRequestError } from "./utils/error";
 import { liveSocketUrl } from "./gemini";
+import { isInceptionModel } from "./inception";
 
 /**
  * The task list, taken from what the Rewindly backend actually calls -- see the
@@ -72,6 +73,11 @@ const TEXT_MODELS = [
   "gemini-3.6-flash",
   "gemini-3.5-flash",
   "gemini-3-flash-preview",
+  // Inception, after every Gemini model: overflow for when the free tier is
+  // spent, not a replacement for it. Moving these to the front makes Mercury
+  // the primary text model with no other change.
+  "mercury-3",
+  "mercury-2.5",
 ];
 
 // ---------------------------------------------------------------------------
@@ -105,8 +111,15 @@ function chatShaped(models: string[]): Intent {
       if (!Array.isArray(messages) || messages.length === 0) {
         throw new BadRequestError("payload.messages must be a non-empty array");
       }
+      const mercury = isInceptionModel(model);
+      // Mercury takes temperature in [0.5, 1] and resets anything else to 1
+      // with a warning -- the opposite of what a caller asking for 0 wanted.
+      const temperature =
+        mercury && typeof options.temperature === "number"
+          ? Math.min(1, Math.max(0.5, options.temperature))
+          : options.temperature;
       return {
-        path: "/v1beta/openai/chat/completions",
+        path: mercury ? "/v1/chat/completions" : "/v1beta/openai/chat/completions",
         body: {
           model,
           messages,
@@ -117,7 +130,7 @@ function chatShaped(models: string[]): Intent {
           ...(payload.tools
             ? { tools: payload.tools, tool_choice: payload.tool_choice ?? "auto" }
             : {}),
-          ...(options.temperature !== undefined ? { temperature: options.temperature } : {}),
+          ...(temperature !== undefined ? { temperature } : {}),
           ...(options.max_output_tokens !== undefined
             ? { max_completion_tokens: options.max_output_tokens }
             : {}),

@@ -1,5 +1,6 @@
-import { bearerToken, parseApiKeys, tokenMatches } from "./config";
+import { type ApiKey, bearerToken, parseApiKeys, tokenMatches } from "./config";
 import { callGemini } from "./gemini";
+import { callInception, INCEPTION_KEY_PREFIX, isInceptionModel } from "./inception";
 import { INTENTS } from "./intents";
 import { QuotaBroker } from "./quota_broker";
 import { relayChatStream } from "./stream";
@@ -21,8 +22,26 @@ export { QuotaBroker };
  *   GET  /debug/usage   same auth, current counters
  */
 
-/** How many (key, model) pairs one request may burn through before giving up. */
-const MAX_ATTEMPTS = 12;
+/**
+ * How many (key, model) pairs one request may burn through before giving up.
+ *
+ * ponytail: four Gemini keys on five text models is twenty pairs, and Mercury
+ * sits after all of them. When Google 429s pairs our counters still think have
+ * room, a cap below that ends the walk before it reaches the overflow. Raise it
+ * with the key count, or block a key on every model at once after a 429.
+ */
+const MAX_ATTEMPTS = 24;
+
+/** Every provider key. Inception's carry a prefix, so no id is ever shared. */
+function providerKeys(env: Env): ApiKey[] {
+  return [
+    ...parseApiKeys(env.GEMINI_API_KEYS),
+    ...parseApiKeys(env.INCEPTION_API_KEYS).map((k) => ({
+      id: `${INCEPTION_KEY_PREFIX}${k.id}`,
+      key: k.key,
+    })),
+  ];
+}
 
 function json(body: unknown, status = 200): Response {
   return new Response(JSON.stringify(body), {
@@ -88,8 +107,8 @@ async function invoke(request: Request, env: Env): Promise<Response> {
     throw new BadRequestError("payload must be an object");
   }
 
-  const keys = parseApiKeys(env.GEMINI_API_KEYS);
-  if (keys.length === 0) throw new AppError("no Gemini keys configured", 503);
+  const keys = providerKeys(env);
+  if (keys.length === 0) throw new AppError("no provider keys configured", 503);
   const keyById = new Map(keys.map((k) => [k.id, k.key]));
   const keyIds = keys.map((k) => k.id);
 
@@ -128,13 +147,10 @@ async function invoke(request: Request, env: Env): Promise<Response> {
     tried.push([keyId, model]);
 
     const upstream = intent.build(model, payload, options, stream);
-    const res = await callGemini(
-      upstream.path,
-      upstream.body,
-      keyById.get(keyId) as string,
-      gw,
-      upstream.timeoutMs,
-    );
+    const apiKey = keyById.get(keyId) as string;
+    const res = isInceptionModel(model)
+      ? await callInception(upstream.path, upstream.body, apiKey, upstream.timeoutMs)
+      : await callGemini(upstream.path, upstream.body, apiKey, gw, upstream.timeoutMs);
 
     if (!res.ok) {
       const detail = (await res.text()).slice(0, 600);
@@ -143,7 +159,9 @@ async function invoke(request: Request, env: Env): Promise<Response> {
       // 429 for a key we believed had headroom: clock drift, a stale estimate,
       // or traffic against this key from outside this system. Believe upstream
       // over the counter, and take that pair out of rotation for a minute.
-      if (res.status === 429) await hop.markExhausted(keyId, model);
+      // Inception's 402 is its token credit running out: the same treatment,
+      // at the same ponytail cost of one rediscovery a minute (quota_broker.ts).
+      if (res.status === 429 || res.status === 402) await hop.markExhausted(keyId, model);
 
       if (worthRetrying(res.status)) continue;
 
@@ -215,7 +233,7 @@ export default {
       if (pathname === "/debug/usage") {
         requireAuth(request, env);
         return json({
-          keys: parseApiKeys(env.GEMINI_API_KEYS).map((k) => k.id),
+          keys: providerKeys(env).map((k) => k.id),
           usage: await broker(env).snapshot(),
         });
       }
