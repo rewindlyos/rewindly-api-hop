@@ -511,6 +511,8 @@ interface Call {
   url: string;
   headers: Headers;
   body: string;
+  /** Whether it was sent with a signal that can cut it off. */
+  timed: boolean;
 }
 
 type Answer = (call: Call, n: number) => Response;
@@ -550,6 +552,7 @@ function google(answers: Partial<Record<string, Answer>> = {}): Call[] {
       url,
       headers: new Headers(init?.headers),
       body: init?.body ? await new Response(init.body).text() : "",
+      timed: init?.signal != null,
     };
     const n = calls.filter((c) => c.step === call.step).length;
     calls.push(call);
@@ -671,6 +674,11 @@ describe("POST /v1/files/video_read", () => {
     ]);
     expect(sent.generationConfig).toEqual(inline.generationConfig);
 
+    // The small steps are cut off if they hang; the upload runs as long as its bytes.
+    expect(
+      Object.fromEntries(calls.filter((c) => c.step !== "read").map((c) => [c.step, c.timed])),
+    ).toEqual({ start: true, upload: false, status: true, delete: true });
+
     // One key throughout: an uploaded file belongs to the key's own project.
     const key = start!.headers.get("x-goog-api-key");
     expect(key).toBeTruthy();
@@ -785,8 +793,28 @@ describe("POST /v1/files/video_read", () => {
     const res = await readVideo({ "x-duration-ms": "5000" });
 
     expect(res.status).toBe(503);
+    // 50 subrequests, less start, upload, delete and the broker's three.
+    expect(calls.filter((c) => c.step === "status")).toHaveLength(44);
     expect(calls.length).toBeLessThanOrEqual(50);
     expect(calls.at(-1)?.step).toBe("delete");
+  });
+
+  it("never sleeps past two minutes, however long each look takes", async () => {
+    const wokeAt: number[] = [];
+    clock.sleep = async (ms) => {
+      now += ms;
+      wokeAt.push(now);
+    };
+    // Each look takes Google a second and a half to answer.
+    google({
+      status: () => {
+        now += 1_500;
+        return Response.json({ ...CLIP, state: "PROCESSING" });
+      },
+    });
+
+    expect((await readVideo({ "x-duration-ms": "5000" })).status).toBe(503);
+    expect(Math.max(...wokeAt)).toBe(120_000);
   });
 
   it("reads a video to its own end when it is under ten minutes, and to ten minutes when longer", async () => {
@@ -809,6 +837,7 @@ describe("POST /v1/files/video_read", () => {
   });
 
   it("503s an upload that breaks off, and reads nothing", async () => {
+    const logged = vi.spyOn(console, "error").mockImplementation(() => {});
     const calls = google({
       upload: () => {
         throw new TypeError("Network connection lost.");
@@ -819,6 +848,33 @@ describe("POST /v1/files/video_read", () => {
 
     expect(res.status).toBe(503);
     expect(calls.map((c) => c.step)).toEqual(["start", "upload"]);
+    expect(logged).toHaveBeenCalledWith(
+      "video_read upload failed:",
+      expect.objectContaining({ message: "Network connection lost." }),
+    );
+  });
+
+  it("503s an upload session Google opened without saying where the bytes go", async () => {
+    const calls = google({ start: () => new Response(null, { status: 200 }) });
+
+    const res = await readVideo({ "x-duration-ms": "5000" });
+
+    expect(res.status).toBe(503);
+    expect(JSON.stringify(await res.json())).toContain("no upload URL");
+    expect(calls.map((c) => c.step)).toEqual(["start"]);
+  });
+
+  it("503s Google failing the read, so the caller retries, and deletes the file", async () => {
+    const calls = google({
+      upload: () => Response.json({ file: { ...CLIP, state: "ACTIVE" } }),
+      read: () => new Response("internal error", { status: 500 }),
+    });
+
+    const res = await readVideo({ "x-duration-ms": "5000" });
+
+    expect(res.status).toBe(503);
+    expect(JSON.stringify(await res.json())).toContain("Gemini answered 500");
+    expect(calls.map((c) => c.step)).toEqual(["start", "upload", "read", "delete"]);
   });
 
   it("passes any other upstream 4xx through with its status, and never the key", async () => {
@@ -852,6 +908,20 @@ describe("POST /v1/files/video_read", () => {
     const row = (await usage()).find(
       (r) => r.key_id === keyIdOf(calls[0]) && r.model === MODEL,
     );
+    expect(row?.blocked_for_ms).toBeGreaterThan(0);
+  });
+
+  // After the 429 above, so it reserves another key, and blocks that one in turn.
+  it("429s and takes the pair out of rotation when Google refuses the key for want of credit", async () => {
+    const calls = google({
+      start: () => Response.json({ error: { code: 402, message: "billing" } }, { status: 402 }),
+    });
+
+    const res = await readVideo({ "x-duration-ms": "5000" });
+
+    expect(res.status).toBe(429);
+    expect(calls.map((c) => c.step)).toEqual(["start"]);
+    const row = (await usage()).find((r) => r.key_id === keyIdOf(calls[0]) && r.model === MODEL);
     expect(row?.blocked_for_ms).toBeGreaterThan(0);
   });
 });

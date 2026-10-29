@@ -45,6 +45,14 @@ const READ_SECONDS = 600;
 const GIVE_UP_MS = 120_000;
 
 /**
+ * How long a small step may take: opening the upload, a look at its state,
+ * the delete. Not the upload, whose length is the video's, nor the read,
+ * which has the intent's own timeout. A step that hangs would otherwise hold
+ * the caller's whole wait, and with it the reservation.
+ */
+const STEP_TIMEOUT_MS = 15_000;
+
+/**
  * Seconds before each look at an upload's state: soon at first, for a short
  * video that is nearly ready, then every 10 s (the last delay repeats). Fifteen
  * looks fill the two minutes.
@@ -220,6 +228,7 @@ async function startUpload(size: number, mime: string, held: Held): Promise<stri
         "content-type": "application/json",
       },
       body: JSON.stringify({ file: { display_name: "video" } }),
+      signal: AbortSignal.timeout(STEP_TIMEOUT_MS),
     }),
   );
   if (!res.ok) throw await refusal(res, held);
@@ -280,9 +289,14 @@ async function untilActive(file: GeminiFile, held: Held): Promise<GeminiFile> {
         503,
       );
     }
-    await clock.sleep(POLL_DELAYS_S[Math.min(polls, POLL_DELAYS_S.length - 1)] * 1000);
+    // Never past the give-up mark: the last look is at two minutes, not after.
+    const delay = POLL_DELAYS_S[Math.min(polls, POLL_DELAYS_S.length - 1)] * 1000;
+    await clock.sleep(Math.min(delay, GIVE_UP_MS - waited));
     const res = await reach("status", () =>
-      fetch2(`${GOOGLE}/v1beta/${file.name}`, { headers: { "x-goog-api-key": held.apiKey } }),
+      fetch2(`${GOOGLE}/v1beta/${file.name}`, {
+        headers: { "x-goog-api-key": held.apiKey },
+        signal: AbortSignal.timeout(STEP_TIMEOUT_MS),
+      }),
     );
     if (!res.ok) throw await refusal(res, held);
     current = (await res.json().catch(() => ({}))) as GeminiFile;
@@ -345,6 +359,7 @@ async function forget(name: string, apiKey: string): Promise<void> {
     const res = await fetch2(`${GOOGLE}/v1beta/${name}`, {
       method: "DELETE",
       headers: { "x-goog-api-key": apiKey },
+      signal: AbortSignal.timeout(STEP_TIMEOUT_MS),
     });
     if (!res.ok) console.warn(`video_read could not delete ${name}: ${res.status}`);
   } catch (err) {

@@ -272,7 +272,8 @@ bytes. They are piped, never buffered, into a Gemini Files API upload on one res
 Gemini reads the file there with `video_read`'s own prompt and settings, and the hop deletes
 it afterwards (`src/files.ts`). A video is read to its own end, or to ten minutes if it runs
 longer. While Google processes the upload the hop looks again after 2, 2, 3, 5 and 8 s, then
-every 10 s, for two minutes at most; the looks are capped so that a read, delete included,
+every 10 s, and the last look starts at two minutes, never after (each look, like the upload's
+start and the delete, is cut off at 15 s); the looks are capped so that a read, delete included,
 stays inside Workers Free's 50 subrequests. `content-length` is required; `x-duration-ms` is
 optional and only sizes the token estimate:
 
