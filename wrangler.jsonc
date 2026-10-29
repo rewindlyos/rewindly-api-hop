@@ -24,8 +24,10 @@
   // Run next to Google, not next to the caller. Gemini refuses some Cloudflare
   // egress locations outright -- 400 FAILED_PRECONDITION "User location is not
   // supported for the API use." -- and SIN was refused on 2026-10-28. A
-  // placement hint applies to fetch handlers, and the Rewindly API reaches this
-  // Worker through a service binding's fetch, so its calls are placed too.
+  // placement hint applies to fetch handlers, not RPC, and the Rewindly API
+  // reaches this Worker through a service binding's fetch, so its calls should
+  // be placed too. Cloudflare does not say so of a binding outright: check it
+  // after the first deploy.
   "placement": { "region": "gcp:us-central1" },
 
   // The source of truth for per-key, per-model usage. A Durable Object and not

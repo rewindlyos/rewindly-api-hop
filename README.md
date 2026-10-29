@@ -10,10 +10,14 @@ our four free-tier Gemini keys serves it, against live per-key quota counters, a
 another when one runs out. The text intents go to Inception's Mercury models first, with
 Gemini as their overflow — see [Inception](#inception).
 
-Deployed at **`https://api-hop.rewindly.workers.dev`**, placed in **`gcp:us-central1`** rather
-than next to its caller: Gemini refuses some Cloudflare egress locations with `400
-FAILED_PRECONDITION` _"User location is not supported"_ (SIN was refused on 2026-10-28), and
-the hint covers the service binding's `fetch` the Rewindly API calls it through.
+Deployed at **`https://api-hop.rewindly.workers.dev`**. `wrangler.jsonc` places it in
+**`gcp:us-central1`** rather than next to its caller, because Gemini refuses some Cloudflare
+egress locations with `400 FAILED_PRECONDITION` _"User location is not supported"_ (SIN was
+refused on 2026-10-28). That takes effect with the first deploy of this branch; the
+deployment before it runs beside its caller. Placement applies to fetch handlers, and the
+Rewindly API calls this Worker through a service binding's `fetch`, so its calls should be
+placed too — Cloudflare does not say so of a binding outright, so it is checked after that
+deploy, not assumed.
 
 ```bash
 curl -X POST https://api-hop.rewindly.workers.dev/v1/invoke \
@@ -286,7 +290,7 @@ curl -X POST $HOP/v1/files/video_read -H "$AUTH" \
 
 Errors: `400` no content-length or not `video/*`; `413` over 100,000,000 bytes; `422` Google
 could not process the file (permanent); `429` no capacity, or the reserved key was refused
-for quota — that pair leaves rotation for a minute and the bytes are not uploaded again on
+for quota or credit (`429`, `402`) — that pair leaves rotation for a minute and the bytes are not uploaded again on
 another key; `503` Gemini refused this location, Google failed (`5xx`) or could not be
 reached, or the file was not ready within 120 s, all worth retrying. Any other `4xx` from
 Google passes through with its status.
