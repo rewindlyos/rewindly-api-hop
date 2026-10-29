@@ -34,18 +34,42 @@ const GOOGLE = "https://generativelanguage.googleapis.com";
 const MAX_BYTES = 100_000_000;
 
 /**
- * ponytail: only the first ten minutes are read (`end_offset`), and only they
- * are charged; the rest of a longer video is never seen. Read it in segments,
- * one `start_offset`/`end_offset` window per call, if longer videos matter.
+ * ponytail: only the first ten minutes are read (`end_offset`, see `endOffset`),
+ * and only they are charged; the rest of a longer video is never seen. Read it
+ * in segments, one `start_offset`/`end_offset` window per call, if longer
+ * videos matter.
  */
 const READ_SECONDS = 600;
 
+/** How long an upload may stay `PROCESSING` before the read gives up on it. */
+const GIVE_UP_MS = 120_000;
+
 /**
- * How often Google is asked whether an upload has finished processing, and how
- * long before giving up on it. An object rather than two constants only so the
- * tests can shorten the wait.
+ * Seconds before each look at an upload's state: soon at first, for a short
+ * video that is nearly ready, then every 10 s (the last delay repeats). Fifteen
+ * looks fill the two minutes.
  */
-export const PROCESSING = { pollMs: 2_000, giveUpMs: 120_000 };
+const POLL_DELAYS_S = [2, 2, 3, 5, 8, 10];
+
+/**
+ * Workers Free allows 50 subrequests per invocation. Besides its looks, a read
+ * spends four fetches -- start, upload, read, delete -- and two broker calls
+ * (the reservation, then the reconcile or a 429's markExhausted). The broker
+ * calls are counted too, though the platform may bill them to its separate
+ * internal-services allowance, so the cap holds either way. The delete, the
+ * last call, therefore always fits, and no file is left behind for 48 hours.
+ */
+const SUBREQUESTS = 50;
+const MAX_POLLS = SUBREQUESTS - 6;
+
+/**
+ * The clock the poll waits on. The tests swap it to run production's schedule
+ * without waiting it out; nothing else changes it.
+ */
+export const clock = {
+  now: (): number => Date.now(),
+  sleep: (ms: number): Promise<void> => new Promise((resolve) => setTimeout(resolve, ms)),
+};
 
 /** What this route reads of a Files API `File`. */
 interface GeminiFile {
@@ -54,6 +78,8 @@ interface GeminiFile {
   mimeType?: string;
   state?: "STATE_UNSPECIFIED" | "PROCESSING" | "ACTIVE" | "FAILED";
   error?: { message?: string };
+  /** Set once Google has processed a video, e.g. `{ videoDuration: "30.5s" }`. */
+  videoMetadata?: { videoDuration?: string };
 }
 
 /** The (key, model) this request reserved, and what every step needs to use it. */
@@ -93,8 +119,8 @@ export async function readVideoFile(
 
   const file = await upload(await startUpload(size, mime, held), request.body, size, held);
   try {
-    await untilActive(file, held);
-    return await read(file, mime, est, held, gw);
+    const active = await untilActive(file, held);
+    return await read(file, endOffset(active), mime, est, held, gw);
   } finally {
     // Read, refused or given up on, the file is of no further use.
     ctx.waitUntil(forget(file.name, apiKey));
@@ -234,32 +260,53 @@ async function upload(
 
 /**
  * A video is usually still `PROCESSING` when its upload finishes, and Gemini
- * will not read it until it is `ACTIVE`.
+ * will not read it until it is `ACTIVE`. Gives up at two minutes or at the
+ * poll cap, whichever comes first, and returns the `ACTIVE` file as Google
+ * last described it.
  */
-async function untilActive(file: GeminiFile, held: Held): Promise<void> {
-  const giveUpAt = Date.now() + PROCESSING.giveUpMs;
+async function untilActive(file: GeminiFile, held: Held): Promise<GeminiFile> {
+  const startedAt = clock.now();
   let current = file;
-  while (current.state !== "ACTIVE") {
+  for (let polls = 0; current.state !== "ACTIVE"; polls++) {
     // Google could not decode it. Permanent: the same bytes fail the same way.
     if (current.state === "FAILED") {
       const why = current.error?.message ? `: ${current.error.message}` : "";
       throw new AppError(`Gemini could not process this video${why}`, 422);
     }
-    if (Date.now() >= giveUpAt) {
-      throw new AppError(`the video was not ready within ${PROCESSING.giveUpMs / 1000} s`, 503);
+    const waited = clock.now() - startedAt;
+    if (polls === MAX_POLLS || waited >= GIVE_UP_MS) {
+      throw new AppError(
+        `the video was still processing after ${polls} checks over ${Math.round(waited / 1000)} s`,
+        503,
+      );
     }
-    await new Promise((resolve) => setTimeout(resolve, PROCESSING.pollMs));
+    await clock.sleep(POLL_DELAYS_S[Math.min(polls, POLL_DELAYS_S.length - 1)] * 1000);
     const res = await reach("status", () =>
       fetch2(`${GOOGLE}/v1beta/${file.name}`, { headers: { "x-goog-api-key": held.apiKey } }),
     );
     if (!res.ok) throw await refusal(res, held);
     current = (await res.json().catch(() => ({}))) as GeminiFile;
   }
+  return current;
+}
+
+/**
+ * Where the read stops: the video's own end, or ten minutes in if it runs
+ * longer. Google documents nothing for an `end_offset` past the end of a
+ * video, and a refusal there would fail every short video for good, so a
+ * video with a known duration is never asked past it. With no duration in
+ * the `ACTIVE` file, ten minutes.
+ */
+function endOffset(active: GeminiFile): string {
+  const duration = active.videoMetadata?.videoDuration ?? "";
+  const seconds = /^\d+(\.\d+)?s$/.test(duration) ? Number(duration.slice(0, -1)) : 0;
+  return seconds > 0 && seconds < READ_SECONDS ? duration : `${READ_SECONDS}s`;
 }
 
 /** The read itself, on the reserved key, as `video_read` reads an inline video. */
 async function read(
   file: GeminiFile,
+  end: string,
   mime: string,
   est: number,
   held: Held,
@@ -267,7 +314,7 @@ async function read(
 ): Promise<Response> {
   const upstream = videoReadRequest(held.model, {
     file_data: { mime_type: file.mimeType ?? mime, file_uri: file.uri },
-    video_metadata: { end_offset: `${READ_SECONDS}s` },
+    video_metadata: { end_offset: end },
   });
   const res = await reach("read", () =>
     callGemini(upstream.path, upstream.body, held.apiKey, gw, upstream.timeoutMs),

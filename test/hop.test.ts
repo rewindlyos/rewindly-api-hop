@@ -1,7 +1,7 @@
 import { env, runInDurableObject, SELF } from "cloudflare:test";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { parseApiKeys, tokenMatches } from "../src/config";
-import { PROCESSING } from "../src/files";
+import { clock } from "../src/files";
 import { INTENTS } from "../src/intents";
 import { relayChatStream } from "../src/stream";
 import { MODEL_QUOTAS } from "../src/quotas";
@@ -599,13 +599,19 @@ interface GenerateContent {
 }
 
 describe("POST /v1/files/video_read", () => {
-  const timing = { ...PROCESSING };
-  // Google is asked every 2 s; nothing here needs to wait that long to see the poll work.
+  const realClock = { ...clock };
+  // Production's poll schedule, on a clock that moves only when the poll sleeps:
+  // two minutes of waiting pass in no time at all.
+  let now = 0;
   beforeEach(() => {
-    PROCESSING.pollMs = 1;
+    now = 0;
+    clock.now = () => now;
+    clock.sleep = async (ms) => {
+      now += ms;
+    };
   });
   afterEach(() => {
-    Object.assign(PROCESSING, timing);
+    Object.assign(clock, realClock);
     vi.restoreAllMocks();
   });
 
@@ -647,7 +653,8 @@ describe("POST /v1/files/video_read", () => {
     });
     expect(upload!.body).toBe(VIDEO);
 
-    // Read by its URI, the first ten minutes at most, with the inline read's prompt and settings.
+    // Read by its URI, with the inline read's prompt and settings. Google gave no
+    // duration here, so the read stops at ten minutes, the most this route reads.
     const inline = INTENTS.video_read!.build(
       MODEL,
       { video_base64: "AA==", mime: "video/mp4" },
@@ -752,15 +759,53 @@ describe("POST /v1/files/video_read", () => {
     expect(calls.map((c) => c.step)).toEqual(["start", "upload", "read", "delete"]);
   });
 
-  it("503s a video still processing when the wait runs out, and deletes it", async () => {
-    PROCESSING.giveUpMs = 20;
+  it("503s a video still processing at two minutes, inside Workers Free's 50 subrequests, deleting it last", async () => {
     const calls = google({ status: () => Response.json({ ...CLIP, state: "PROCESSING" }) });
 
     const res = await readVideo({ "x-duration-ms": "5000" });
 
     expect(res.status).toBe(503);
+    // 2, 2, 3, 5 and 8 s, then every 10 s: fifteen looks in two minutes, not sixty.
+    expect(calls.filter((c) => c.step === "status")).toHaveLength(15);
+    expect(now).toBe(120_000);
     expect(calls.map((c) => c.step)).not.toContain("read");
+    expect(calls.length).toBeLessThanOrEqual(50);
     expect(calls.at(-1)?.step).toBe("delete");
+  });
+
+  it("stops looking at the poll cap even on a clock that never moves, so the delete still fits", async () => {
+    // Time stands still, so only the cap can end the wait. The guard turns a
+    // poll that never stops into a failure instead of a hung suite.
+    let sleeps = 0;
+    clock.sleep = async () => {
+      if (++sleeps > 100) throw new Error("the poll never stopped");
+    };
+    const calls = google({ status: () => Response.json({ ...CLIP, state: "PROCESSING" }) });
+
+    const res = await readVideo({ "x-duration-ms": "5000" });
+
+    expect(res.status).toBe(503);
+    expect(calls.length).toBeLessThanOrEqual(50);
+    expect(calls.at(-1)?.step).toBe("delete");
+  });
+
+  it("reads a video to its own end when it is under ten minutes, and to ten minutes when longer", async () => {
+    // The duration comes from the ACTIVE file the last look returned, not from the upload.
+    const endOffsetFor = async (videoDuration: string) => {
+      const calls = google({
+        status: () =>
+          Response.json({ ...CLIP, state: "ACTIVE", videoMetadata: { videoDuration } }),
+      });
+      expect((await readVideo({ "x-duration-ms": "30000" })).status).toBe(200);
+      vi.restoreAllMocks();
+      const read = calls.find((c) => c.step === "read");
+      return (JSON.parse(read!.body) as GenerateContent).contents[0]!.parts[0];
+    };
+
+    expect(await endOffsetFor("30s")).toMatchObject({ video_metadata: { end_offset: "30s" } });
+    expect(await endOffsetFor("1250.5s")).toMatchObject({
+      video_metadata: { end_offset: "600s" },
+    });
   });
 
   it("503s an upload that breaks off, and reads nothing", async () => {

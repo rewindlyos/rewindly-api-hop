@@ -270,8 +270,11 @@ curl -X POST $HOP/v1/invoke -H "$AUTH" -H "$JSON" -d "{
 **video_read, from a file** — a bigger video, up to 100 MB, goes to its own route as raw
 bytes. They are piped, never buffered, into a Gemini Files API upload on one reserved key;
 Gemini reads the file there with `video_read`'s own prompt and settings, and the hop deletes
-it afterwards (`src/files.ts`). Only the first ten minutes are read. `content-length` is
-required; `x-duration-ms` is optional and only sizes the token estimate:
+it afterwards (`src/files.ts`). A video is read to its own end, or to ten minutes if it runs
+longer. While Google processes the upload the hop looks again after 2, 2, 3, 5 and 8 s, then
+every 10 s, for two minutes at most; the looks are capped so that a read, delete included,
+stays inside Workers Free's 50 subrequests. `content-length` is required; `x-duration-ms` is
+optional and only sizes the token estimate:
 
 ```bash
 curl -X POST $HOP/v1/files/video_read -H "$AUTH" \
