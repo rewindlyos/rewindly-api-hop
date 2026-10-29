@@ -1,7 +1,8 @@
 # rewindly-api-hop
 
 The AI gateway for Rewindly. **One URL, one API key, one endpoint** — for every AI task
-the backend performs, whatever kind of task it is.
+the backend performs, whatever kind of task it is. The one exception is a video too big to
+send inline, which has a route of its own.
 
 The backend does not choose a model, does not hold a provider key, and does not know
 how many keys exist. It names an **intent**; this Worker decides which model and which of
@@ -9,7 +10,14 @@ our four free-tier Gemini keys serves it, against live per-key quota counters, a
 another when one runs out. The text intents go to Inception's Mercury models first, with
 Gemini as their overflow — see [Inception](#inception).
 
-Deployed at **`https://api-hop.rewindly.workers.dev`**.
+Deployed at **`https://api-hop.rewindly.workers.dev`**. `wrangler.jsonc` places it in
+**`gcp:us-central1`** rather than next to its caller, because Gemini refuses some Cloudflare
+egress locations with `400 FAILED_PRECONDITION` _"User location is not supported"_ (SIN was
+refused on 2026-10-28). That takes effect with the first deploy of this branch; the
+deployment before it runs beside its caller. Placement applies to fetch handlers, and the
+Rewindly API calls this Worker through a service binding's `fetch`, so its calls should be
+placed too — Cloudflare does not say so of a binding outright, so it is checked after that
+deploy, not assumed.
 
 ```bash
 curl -X POST https://api-hop.rewindly.workers.dev/v1/invoke \
@@ -22,11 +30,12 @@ curl -X POST https://api-hop.rewindly.workers.dev/v1/invoke \
 
 ## Public surface
 
-| Route              | Auth                                          | What it does                                    |
-| ------------------ | --------------------------------------------- | ----------------------------------------------- |
-| `POST /v1/invoke`  | `Authorization: Bearer <HOP_GATEWAY_API_KEY>` | The only task endpoint.                         |
-| `GET /health`      | none                                          | Liveness, plus the list of implemented intents. |
-| `GET /debug/usage` | same bearer                                   | Current per-key, per-model counters and limits. |
+| Route                       | Auth                                          | What it does                                                                             |
+| --------------------------- | --------------------------------------------- | ---------------------------------------------------------------------------------------- |
+| `POST /v1/invoke`           | `Authorization: Bearer <HOP_GATEWAY_API_KEY>` | Every task, named by its intent.                                                         |
+| `POST /v1/files/video_read` | same bearer                                   | A video too big to send inline, as raw bytes — see [video_read, from a file](#examples). |
+| `GET /health`               | none                                          | Liveness, plus the list of implemented intents.                                          |
+| `GET /debug/usage`          | same bearer                                   | Current per-key, per-model counters and limits.                                          |
 
 There is nothing else. Every provider-prefixed passthrough, `/v1/chat/completions`,
 `/v1/models`, and the `/key/{index}/` selector are gone — see [What was
@@ -252,7 +261,7 @@ curl -X POST $HOP/v1/invoke -H "$AUTH" -H "$JSON" -d "{
 
 **video_read** — a video from the phone, inline on the same surface, read at low media
 resolution: what it shows, what is said and what is on screen. The caller keeps it under
-the 20 MB inline request:
+the 20 MB inline request (about 14 MB of video once base64-encoded):
 
 ```bash
 curl -X POST $HOP/v1/invoke -H "$AUTH" -H "$JSON" -d "{
@@ -261,6 +270,30 @@ curl -X POST $HOP/v1/invoke -H "$AUTH" -H "$JSON" -d "{
 }"
 # -> {"result": {"text": "A walk along Juhu beach at sunset..."}}
 ```
+
+**video_read, from a file** — a bigger video, up to 100 MB, goes to its own route as raw
+bytes. They are piped, never buffered, into a Gemini Files API upload on one reserved key;
+Gemini reads the file there with `video_read`'s own prompt and settings, and the hop deletes
+it afterwards (`src/files.ts`). A video is read to its own end, or to ten minutes if it runs
+longer. While Google processes the upload the hop looks again after 2, 2, 3, 5 and 8 s, then
+every 10 s, and the last look starts at two minutes, never after (each look, like the upload's
+start and the delete, is cut off at 15 s); the looks are capped so that a read, delete included,
+stays inside Workers Free's 50 subrequests. `content-length` is required; `x-duration-ms` is
+optional and only sizes the token estimate:
+
+```bash
+curl -X POST $HOP/v1/files/video_read -H "$AUTH" \
+  -H 'content-type: video/mp4' -H 'x-duration-ms: 95000' \
+  --data-binary @clip.mp4
+# -> the same envelope /v1/invoke answers video_read with
+```
+
+Errors: `400` no content-length or not `video/*`; `413` over 100,000,000 bytes; `422` Google
+could not process the file (permanent); `429` no capacity, or the reserved key was refused
+for quota or credit (`429`, `402`) — that pair leaves rotation for a minute and the bytes are not uploaded again on
+another key; `503` Gemini refused this location, Google failed (`5xx`) or could not be
+reached, or the file was not ready within 120 s, all worth retrying. Any other `4xx` from
+Google passes through with its status.
 
 **live_session** — returns a complete socket URL with a single-use token in it:
 

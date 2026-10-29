@@ -18,6 +18,9 @@ const SENSITIVE_PARAMS = [
   "authorization",
   "password",
   "secret",
+  // A Files API upload session's URL carries its id, and the id alone is
+  // enough to write bytes into the session until it closes.
+  "upload_id",
 ];
 
 export function maskUrl(url: string): string {

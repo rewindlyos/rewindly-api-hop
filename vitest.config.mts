@@ -7,8 +7,9 @@ export default defineConfig({
       wrangler: { configPath: "./wrangler.jsonc" },
       miniflare: {
         bindings: {
-          // Fake keys. Nothing in the suite reaches Google -- the broker tests
-          // exercise selection, and the route tests stop at 401/400/404.
+          // Fake keys. Nothing in the suite reaches Google or Inception -- the
+          // broker tests exercise selection, and every route test that gets
+          // past auth and validation answers from a mocked fetch.
           GEMINI_API_KEYS:
             '[{"id":"key-1","key":"t1"},{"id":"key-2","key":"t2"},{"id":"key-3","key":"t3"},{"id":"key-4","key":"t4"}]',
           INCEPTION_API_KEYS: '[{"id":"a","key":"m1"},{"id":"b","key":"m2"}]',

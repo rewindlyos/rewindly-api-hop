@@ -1,0 +1,368 @@
+import type { ApiKey } from "./config";
+import { type AiGatewayConfig, callGemini } from "./gemini";
+import { INTENTS, videoReadRequest } from "./intents";
+import type { QuotaBroker } from "./quota_broker";
+import { AppError, BadRequestError } from "./utils/error";
+import { fetch2 } from "./utils/helpers";
+
+/**
+ * `POST /v1/files/video_read`: a saved video read back as text through
+ * Gemini's Files API, for one too big for `/v1/invoke`.
+ *
+ * `/v1/invoke` carries a video as base64 inside JSON, and Gemini takes at most
+ * 20 MB inline -- about a 14 MB video once it is encoded. Here the caller sends
+ * the raw bytes instead. They stream through this Worker into a resumable
+ * upload without being held in memory, Gemini reads the file by its URI, and
+ * the file is deleted once it has been read. The prompt, the generation
+ * settings and the parse are `video_read`'s own, so the answer is the envelope
+ * `/v1/invoke` gives for that intent.
+ *
+ * One reserved key does every step. An uploaded file belongs to the project of
+ * the key that uploaded it, so only that key can read it, and a refusal partway
+ * cannot move to another key without uploading the bytes again.
+ */
+
+/**
+ * Google's own origin, for every Files API step. The upload is a resumable
+ * session on Google's upload endpoint and its bytes go to the session URL
+ * Google answers with, so the file steps go to Google directly, and only the
+ * read itself takes AI Gateway when that is configured.
+ */
+const GOOGLE = "https://generativelanguage.googleapis.com";
+
+/** The largest video this route takes, by its declared content-length. */
+const MAX_BYTES = 100_000_000;
+
+/**
+ * ponytail: only the first ten minutes are read (`end_offset`, see `endOffset`),
+ * and only they are charged; the rest of a longer video is never seen. Read it
+ * in segments, one `start_offset`/`end_offset` window per call, if longer
+ * videos matter.
+ */
+const READ_SECONDS = 600;
+
+/** How long an upload may stay `PROCESSING` before the read gives up on it. */
+const GIVE_UP_MS = 120_000;
+
+/**
+ * How long a small step may take: opening the upload, a look at its state,
+ * the delete. Not the upload, whose length is the video's, nor the read,
+ * which has the intent's own timeout. A step that hangs would otherwise hold
+ * the caller's whole wait, and with it the reservation.
+ */
+const STEP_TIMEOUT_MS = 15_000;
+
+/**
+ * Seconds before each look at an upload's state: soon at first, for a short
+ * video that is nearly ready, then every 10 s (the last delay repeats). Fifteen
+ * looks fill the two minutes.
+ */
+const POLL_DELAYS_S = [2, 2, 3, 5, 8, 10];
+
+/**
+ * Workers Free allows 50 subrequests per invocation. Besides its looks, a read
+ * spends four fetches -- start, upload, read, delete -- and two broker calls
+ * (the reservation, then the reconcile or a 429's markExhausted). The broker
+ * calls are counted too, though the platform may bill them to its separate
+ * internal-services allowance, so the cap holds either way. The delete, the
+ * last call, therefore always fits, and no file is left behind for 48 hours.
+ */
+const SUBREQUESTS = 50;
+const MAX_POLLS = SUBREQUESTS - 6;
+
+/**
+ * The clock the poll waits on. The tests swap it to run production's schedule
+ * without waiting it out; nothing else changes it.
+ */
+export const clock = {
+  now: (): number => Date.now(),
+  sleep: (ms: number): Promise<void> => new Promise((resolve) => setTimeout(resolve, ms)),
+};
+
+/** What this route reads of a Files API `File`. */
+interface GeminiFile {
+  name: string;
+  uri: string;
+  mimeType?: string;
+  state?: "STATE_UNSPECIFIED" | "PROCESSING" | "ACTIVE" | "FAILED";
+  error?: { message?: string };
+  /** Set once Google has processed a video, e.g. `{ videoDuration: "30.5s" }`. */
+  videoMetadata?: { videoDuration?: string };
+}
+
+/** The (key, model) this request reserved, and what every step needs to use it. */
+interface Held {
+  keyId: string;
+  model: string;
+  apiKey: string;
+  hop: DurableObjectStub<QuotaBroker>;
+}
+
+/** What index.ts owns and hands over: the keys, the one broker, AI Gateway's config. */
+interface Gateway {
+  keys: ApiKey[];
+  hop: DurableObjectStub<QuotaBroker>;
+  gw: AiGatewayConfig;
+}
+
+export async function readVideoFile(
+  request: Request,
+  ctx: ExecutionContext,
+  { keys, hop, gw }: Gateway,
+): Promise<Response> {
+  const size = declaredSize(request.headers.get("content-length"));
+  const mime = videoMime(request.headers.get("content-type"));
+  if (!request.body) throw new BadRequestError("the body must be the video's bytes");
+
+  if (keys.length === 0) throw new AppError("no provider keys configured", 503);
+  const est = estimate(request.headers.get("x-duration-ms"));
+  const ids = keys.map((k) => k.id);
+  const reservation = await hop.reserve(ids, INTENTS.video_read.models, est, []);
+  if (!reservation) {
+    throw new AppError("no capacity for intent video_read on any key or candidate model", 429);
+  }
+  const { keyId, model } = reservation;
+  const apiKey = keys.find((k) => k.id === keyId)?.key as string;
+  const held: Held = { keyId, model, apiKey, hop };
+
+  const file = await upload(await startUpload(size, mime, held), request.body, size, held);
+  try {
+    const active = await untilActive(file, held);
+    return await read(file, endOffset(active), mime, est, held, gw);
+  } finally {
+    // Read, refused or given up on, the file is of no further use.
+    ctx.waitUntil(forget(file.name, apiKey));
+  }
+}
+
+/**
+ * Required, and checked before anything is spent: an upload session declares
+ * its length up front, and a body of unknown length cannot be held to the cap
+ * until it has already been sent.
+ */
+function declaredSize(header: string | null): number {
+  if (header === null || !/^\d+$/.test(header)) {
+    throw new BadRequestError("content-length is required: the video's size in bytes");
+  }
+  const size = Number(header);
+  if (size < 1) throw new BadRequestError("the video is empty");
+  if (size > MAX_BYTES) throw new AppError(`a video is at most ${MAX_BYTES} bytes`, 413);
+  return size;
+}
+
+/** The video's own type, which Google stores the file as. Parameters are dropped. */
+function videoMime(header: string | null): string {
+  const mime = (header ?? "").split(";")[0].trim().toLowerCase();
+  if (!/^video\/[a-z0-9][a-z0-9.+-]*$/.test(mime)) {
+    throw new BadRequestError("content-type must be the video's own video/* type");
+  }
+  return mime;
+}
+
+/**
+ * ponytail: ~100 tokens a second, Google's figure for video at low media
+ * resolution (a frame a second plus the audio), for the part that is read,
+ * and 2,000 for the prompt and the answer. It only gates TPM until the
+ * reconcile; a caller that does not know the duration is charged the whole
+ * ten minutes, which over-reserves, the safe direction. Ask `countTokens`
+ * about the uploaded file if this ever routes to a tight-TPM model.
+ */
+function estimate(durationMs: string | null): number {
+  const seconds =
+    durationMs !== null && /^\d+$/.test(durationMs) ? Number(durationMs) / 1000 : READ_SECONDS;
+  return Math.ceil(Math.min(seconds, READ_SECONDS) * 100) + 2_000;
+}
+
+/**
+ * A sub-request that never got an answer -- a dropped connection, a timeout,
+ * a body shorter or longer than it said -- is worth trying again later, so it
+ * is a 503. Logged here, because the caller is only told which step failed.
+ */
+async function reach(step: string, call: () => Promise<Response>): Promise<Response> {
+  try {
+    return await call();
+  } catch (err) {
+    console.error(`video_read ${step} failed:`, err);
+    throw new AppError(`video_read ${step} failed`, 503);
+  }
+}
+
+/**
+ * What an upstream refusal means for the caller. The same at every step,
+ * because the same key is behind each one.
+ */
+async function refusal(res: Response, held: Held): Promise<AppError> {
+  // Scrubbed before it is cut, so a key straddling the cut leaves no half of
+  // itself behind.
+  const body = (await res.text().catch(() => "")).split(held.apiKey).join("[key]");
+  const detail = body.slice(0, 600);
+
+  if (res.status === 429 || res.status === 402) {
+    // ponytail: a refused key ends the request. The bytes are not uploaded
+    // again on another key; the caller's job retries the whole read later.
+    // Re-upload on the next reserved key if those retries start running out.
+    await held.hop.markExhausted(held.keyId, held.model);
+    return new AppError(`${held.keyId}/${held.model}: ${res.status} ${detail}`, 429);
+  }
+  // Gemini refuses some locations outright. The request is not at fault -- the
+  // same video reads from elsewhere -- so the caller is told to come back, not
+  // to give up.
+  if (res.status === 400 && /User location is not supported|FAILED_PRECONDITION/.test(body)) {
+    return new AppError(`Gemini refused this location: ${detail}`, 503);
+  }
+  if (res.status >= 400 && res.status < 500) return new AppError(detail, res.status);
+  return new AppError(`Gemini answered ${res.status}: ${detail}`, 503);
+}
+
+/** Opens a resumable upload session. Google answers with the URL the bytes go to. */
+async function startUpload(size: number, mime: string, held: Held): Promise<string> {
+  const res = await reach("upload start", () =>
+    fetch2(`${GOOGLE}/upload/v1beta/files`, {
+      method: "POST",
+      headers: {
+        "x-goog-api-key": held.apiKey,
+        "X-Goog-Upload-Protocol": "resumable",
+        "X-Goog-Upload-Command": "start",
+        "X-Goog-Upload-Header-Content-Length": String(size),
+        "X-Goog-Upload-Header-Content-Type": mime,
+        "content-type": "application/json",
+      },
+      body: JSON.stringify({ file: { display_name: "video" } }),
+      signal: AbortSignal.timeout(STEP_TIMEOUT_MS),
+    }),
+  );
+  if (!res.ok) throw await refusal(res, held);
+  const url = res.headers.get("x-goog-upload-url");
+  if (!url) throw new AppError("video_read upload start returned no upload URL", 503);
+  return url;
+}
+
+/**
+ * Every byte in one request, then finalize. Piped, never buffered: a 100 MB
+ * video held whole would take most of an isolate's 128 MB. `FixedLengthStream`
+ * declares the length the upload protocol asks for, and errors if the
+ * caller's body is shorter or longer than its content-length said, so a cut-off
+ * upload fails here instead of being read as a shorter video.
+ */
+async function upload(
+  url: string,
+  body: ReadableStream,
+  size: number,
+  held: Held,
+): Promise<GeminiFile> {
+  const res = await reach("upload", () =>
+    fetch2(url, {
+      method: "POST",
+      headers: {
+        "X-Goog-Upload-Command": "upload, finalize",
+        "X-Goog-Upload-Offset": "0",
+        "content-length": String(size),
+      },
+      body: body.pipeThrough(new FixedLengthStream(size)),
+    }),
+  );
+  if (!res.ok) throw await refusal(res, held);
+  const { file } = (await res.json().catch(() => ({}))) as { file?: GeminiFile };
+  if (!file?.name || !file.uri) throw new AppError("video_read upload returned no file", 503);
+  return file;
+}
+
+/**
+ * A video is usually still `PROCESSING` when its upload finishes, and Gemini
+ * will not read it until it is `ACTIVE`. Gives up at two minutes or at the
+ * poll cap, whichever comes first, and returns the `ACTIVE` file as Google
+ * last described it.
+ */
+async function untilActive(file: GeminiFile, held: Held): Promise<GeminiFile> {
+  const startedAt = clock.now();
+  let current = file;
+  for (let polls = 0; current.state !== "ACTIVE"; polls++) {
+    // Google could not decode it. Permanent: the same bytes fail the same way.
+    if (current.state === "FAILED") {
+      const why = current.error?.message ? `: ${current.error.message}` : "";
+      throw new AppError(`Gemini could not process this video${why}`, 422);
+    }
+    const waited = clock.now() - startedAt;
+    if (polls === MAX_POLLS || waited >= GIVE_UP_MS) {
+      throw new AppError(
+        `the video was still processing after ${polls} checks over ${Math.round(waited / 1000)} s`,
+        503,
+      );
+    }
+    // Never past the give-up mark: the last look is at two minutes, not after.
+    const delay = POLL_DELAYS_S[Math.min(polls, POLL_DELAYS_S.length - 1)] * 1000;
+    await clock.sleep(Math.min(delay, GIVE_UP_MS - waited));
+    const res = await reach("status", () =>
+      fetch2(`${GOOGLE}/v1beta/${file.name}`, {
+        headers: { "x-goog-api-key": held.apiKey },
+        signal: AbortSignal.timeout(STEP_TIMEOUT_MS),
+      }),
+    );
+    if (!res.ok) throw await refusal(res, held);
+    current = (await res.json().catch(() => ({}))) as GeminiFile;
+  }
+  return current;
+}
+
+/**
+ * Where the read stops: the video's own end, or ten minutes in if it runs
+ * longer. Google documents nothing for an `end_offset` past the end of a
+ * video, and a refusal there would fail every short video for good, so a
+ * video with a known duration is never asked past it. With no duration in
+ * the `ACTIVE` file, ten minutes.
+ */
+function endOffset(active: GeminiFile): string {
+  const duration = active.videoMetadata?.videoDuration ?? "";
+  const seconds = /^\d+(\.\d+)?s$/.test(duration) ? Number(duration.slice(0, -1)) : 0;
+  return seconds > 0 && seconds < READ_SECONDS ? duration : `${READ_SECONDS}s`;
+}
+
+/** The read itself, on the reserved key, as `video_read` reads an inline video. */
+async function read(
+  file: GeminiFile,
+  end: string,
+  mime: string,
+  est: number,
+  held: Held,
+  gw: AiGatewayConfig,
+): Promise<Response> {
+  const upstream = videoReadRequest(held.model, {
+    file_data: { mime_type: file.mimeType ?? mime, file_uri: file.uri },
+    video_metadata: { end_offset: end },
+  });
+  const res = await reach("read", () =>
+    callGemini(upstream.path, upstream.body, held.apiKey, gw, upstream.timeoutMs),
+  );
+  if (!res.ok) throw await refusal(res, held);
+
+  const parsed = INTENTS.video_read.parse((await res.json()) as Record<string, unknown>);
+  // Correct the TPM estimate with what was billed, as /v1/invoke does.
+  if (parsed.usage.total_tokens > 0) {
+    await held.hop.reconcile(held.keyId, held.model, est, parsed.usage.total_tokens);
+  }
+  return Response.json({
+    intent: "video_read",
+    model_used: held.model,
+    key_id: held.keyId,
+    result: parsed.result,
+    usage: parsed.usage,
+  });
+}
+
+/**
+ * Best effort, off the answer's path. A file left behind counts against the
+ * project's 20 GB of Files storage until Google expires it after 48 hours, so
+ * a failed delete is logged -- but it never fails the read.
+ */
+async function forget(name: string, apiKey: string): Promise<void> {
+  try {
+    const res = await fetch2(`${GOOGLE}/v1beta/${name}`, {
+      method: "DELETE",
+      headers: { "x-goog-api-key": apiKey },
+      signal: AbortSignal.timeout(STEP_TIMEOUT_MS),
+    });
+    if (!res.ok) console.warn(`video_read could not delete ${name}: ${res.status}`);
+  } catch (err) {
+    console.warn(`video_read could not delete ${name}:`, err);
+  }
+}
