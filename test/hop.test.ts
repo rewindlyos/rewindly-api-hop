@@ -793,7 +793,9 @@ describe("POST /v1/files/video_read", () => {
     const res = await readVideo({ "x-duration-ms": "5000" });
 
     expect(res.status).toBe(503);
-    // 50 subrequests, less start, upload, delete and the broker's three.
+    // 50 subrequests, less the four fetches a read makes besides its looks (start,
+    // upload, read, delete) and the broker's two (the reservation, then the
+    // reconcile or a refusal's markExhausted).
     expect(calls.filter((c) => c.step === "status")).toHaveLength(44);
     expect(calls.length).toBeLessThanOrEqual(50);
     expect(calls.at(-1)?.step).toBe("delete");
